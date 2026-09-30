@@ -1,0 +1,15 @@
+{
+  "originHash" : "67ff485e1b7a76bf192318449e2bb11176cdd2ebc0f2f125998b23594a2d6fce",
+  "pins" : [
+    {
+      "identity" : "prompter-kit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mikecann/prompter-kit.git",
+      "state" : {
+        "revision" : "903ab35a86c173b1bfbbe53b754b73fc0fcc4b05",
+        "version" : "1.0.0"
+      }
+    }
+  ],
+  "version" : 3
+}

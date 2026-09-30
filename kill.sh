@@ -29,8 +29,7 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-pkill -f "$SCRIPT_DIR/taskbar.py" 2>/dev/null && STOPPED=1
-pkill -f "tools/taskbar/taskbar.py" 2>/dev/null && STOPPED=1
+pkill -f "^.*${SCRIPT_DIR_PATTERN}/taskbar\.py([[:space:]].*)?$" 2>/dev/null && STOPPED=1
 pkill -f "^${APP_BIN_PATTERN}$" 2>/dev/null && STOPPED=1
 pkill -f "^${SCRIPT_DIR_PATTERN}/\.build/.*/taskbar-swift$" 2>/dev/null && STOPPED=1
 

@@ -1,63 +1,79 @@
-![Mikerosoft Taskbar on macOS with pinned apps, minimised windows, widgets, and per-monitor settings](docs/header.webp)
+# <img src="icons/taskbar.png" width="24" alt=""> taskbar
 
-# taskbar
+A Windows-style taskbar for your Mac, one on every monitor
 
-Windows-style taskbar for macOS, built in Swift/AppKit.
+macOS
 
-It draws a compact taskbar at the bottom of every monitor, shows each visible
-window as its own item, lets you pin apps, and can keep normal app windows from
-maximising underneath the bar.
+<!-- media: hero -->
+<!-- ![taskbar](docs/hero.png) -->
+<!-- media: hero -->
 
-## What it does
+![Taskbar on macOS with pinned apps, windows, widgets, and per-monitor settings](docs/header.webp)
 
-- Shows one taskbar per monitor
-- Shows every window individually instead of grouping by app
-- Shows compact launchers for running apps without represented windows
-- Reacts to app and focused-window changes, with a one-second polling fallback
-- Minimises the active window when its item is clicked again, and restores it on the next click
-- Keeps the selected app highlighted with a sliding pill
-- Pins apps so they stay visible when closed
-- Gives open windows equal widths when crowded, keeping closed pinned launchers compact
-- Expands the selected window to read its label, shrinking the other buttons to fit
-- Ellipsises long labels
-- Mirrors app-wide Dock notification badges, including unread dots (requires Accessibility permission); checks every two seconds and refreshes immediately when results change
-- Fits complete stats values into compact modules without truncating percentages or transfer units
-- Supports Date & Time, Battery, Stats, and Control Center Lights taskbar widgets
-- Lets widgets own their menu, rendering, and settings surface
-- Auto-hides with configurable animation
-- Hides on any monitor occupied by a foreground fullscreen app or game
-- Controls taskbar size, item width, item spacing, and background opacity
-- Keeps normal windows above the taskbar when apps maximise
-- Opens the settings window for the monitor you right-clicked
-- Supports global defaults plus per-monitor overrides
-- Can start automatically at login
+## What it is
 
-## Quick start
+This puts a Windows-style taskbar along the bottom of every monitor on macOS. Every window gets its own button instead of being lumped in with its app, and you can pin the apps you always want there.
+
+It has a few little widgets too, like the date and time, battery, CPU and network stats, and a single button that turns my Elgato lights on and off. You can set things globally and then tweak them for each monitor.
+
+## Get it
+
+Paste this into your AI coding agent (Claude Code, Codex, Cursor...):
+
+> Clone https://github.com/mikecann/taskbar and make it my own. It's one of Mike
+> Cann's personal tools, so read the README first, change anything specific to his
+> setup to suit mine, then help me get it running.
+
+### Or set it up by hand
+
+You need macOS 13 or newer, Git, and Xcode or the Xcode Command Line Tools with
+Swift 5.10 or newer. Install the Command Line Tools with `xcode-select --install`
+if needed. Python 3 is only needed for the legacy model and launcher tests.
+There are no API keys or `.env` files to set up.
 
 ```bash
-bash tools/taskbar/setup_mac.sh
-bash tools/taskbar/restart.sh
+git clone https://github.com/mikecann/taskbar.git
+cd taskbar
+bash setup_mac.sh
+bash install.sh
+bash restart.sh
 ```
 
-If you have run the root macOS installer, you can use the launcher:
+`setup_mac.sh` downloads the Swift dependency and builds the app. `install.sh`
+puts a symlink to the launcher in `~/.local/bin`; you can choose another directory
+with `bash install.sh /path/to/bin`. Add that directory to your PATH if needed:
 
 ```bash
-taskbar restart
-taskbar settings
-taskbar stop
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Otherwise open settings directly:
+Add that line to `~/.zshrc` to keep it for new terminals. Re-run `install.sh` if
+you move the clone. `restart.sh` stages and signs the app bundle, then launches
+it through launchd. Grant the permissions listed below to that app.
+
+The Swift dependency is [prompter-kit](https://github.com/mikecann/prompter-kit),
+version 1.0.0 or newer. It needs to be published with that tag before a fresh
+clone can build.
+
+## Using it
 
 ```bash
-bash tools/taskbar/open-settings.sh
+taskbar restart   # Build and relaunch, also the default with no argument
+taskbar settings  # Open settings in the running app
+taskbar stop      # Stop the app
 ```
 
-Stop it with:
+You can also run `bash restart.sh`, `bash open-settings.sh`, or `bash kill.sh`
+directly from this clone.
 
-```bash
-bash tools/taskbar/kill.sh
-```
+Click a window button to bring it forward, or restore it if it is minimised.
+Clicking the already selected window keeps it active. Right-click an app to pin
+it, and right-click the bar to open settings for that monitor. Enable Start at
+login in settings if you want it to launch automatically.
+
+The bar hides for foreground fullscreen apps and can auto-hide. The settings
+also let you keep normal windows above it, adjust button widths and spacing,
+and choose widgets for each monitor.
 
 ## Settings
 
@@ -110,7 +126,11 @@ Control Center Lights discovers Elgato lights through Bonjour and shows one
 power button. A click reads every reachable light first. If they are all on it
 turns them all off; otherwise it turns them all on. The request changes only
 power, preserving each light's brightness and colour temperature. When the
-button turns the studio on, it also opens `~/Applications/Record It.app`.
+button turns the studio on, it also opens `~/Applications/Record It.app` if it
+is installed. That is my
+[record-it](https://github.com/mikecann/record-it) tool, and you can change
+`recordItLaunchURL` in `Sources/TaskbarApp/TaskbarController.swift`
+if you want it to open something else.
 Turning the studio off leaves Record It alone so an active recording is never
 quit unexpectedly.
 
@@ -121,6 +141,12 @@ Prompter by name, so turning the studio off also stops its DisplayLink display
 stream and turning the studio on reconnects it. This option is off by default
 when upgrading so an existing lights button never unexpectedly disables a
 display.
+
+The lights button also changes scaling on my PA27JCV display by default, using
+larger text when the lights turn on and the default mode when they turn off.
+Disable **Scale PA27JCV for Studio** in the widget settings if
+that does not suit your setup. The Prompter helper comes from
+[prompter-kit](https://github.com/mikecann/prompter-kit).
 
 Stats shows CPU, RAM, and network activity in a compact strip. CPU can show a
 percentage, aggregate usage history, or one live utilisation bar per logical
@@ -165,19 +191,19 @@ Logs go to:
 Run the Swift tests:
 
 ```bash
-swift test --package-path tools/taskbar
+swift test
 ```
 
-Run the small Python model tests left from the original spike:
+Run the Python model tests and installer/launcher checks:
 
 ```bash
-python3 -m unittest tools/taskbar/tests/test_taskbar_model.py
+python3 -m unittest discover -s tests -v
 ```
 
 Restart the app after code changes:
 
 ```bash
-bash tools/taskbar/restart.sh
+bash restart.sh
 ```
 
 ## Notes
@@ -185,3 +211,9 @@ bash tools/taskbar/restart.sh
 This started as a Python prototype, so the old Python files are still in this
 folder for reference. The real app is now the Swift package under
 `Sources/TaskbarApp`.
+
+## More tools
+
+You can find my other tools at [mikerosoft.app](https://mikerosoft.app).
+
+MIT licensed.

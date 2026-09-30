@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Check shell syntax
+        run: |
+          for script in *.sh taskbar; do
+            bash -n "$script"
+          done
+      - name: Python model and launcher tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Swift tests
+        run: swift test

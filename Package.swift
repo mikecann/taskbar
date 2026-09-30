@@ -10,13 +10,13 @@ let package = Package(
         .executable(name: "taskbar-swift", targets: ["TaskbarApp"])
     ],
     dependencies: [
-        .package(path: "../lib/PrompterKit")
+        .package(url: "https://github.com/mikecann/prompter-kit.git", from: "1.0.0")
     ],
     targets: [
         .executableTarget(
             name: "TaskbarApp",
             dependencies: [
-                .product(name: "PrompterKit", package: "PrompterKit")
+                .product(name: "PrompterKit", package: "prompter-kit")
             ],
             path: "Sources/TaskbarApp"
         ),
