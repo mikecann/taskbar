@@ -1195,7 +1195,7 @@ final class TaskbarSettingsTests: XCTestCase {
     }
 
     func testInstalledWidgetsIncludeStatsBatteryAndLightsBeforeDateTime() {
-        XCTAssertEqual(installedTaskbarWidgetIDs(), [.stats, .battery, .controlCenterLights, .dateTime])
+        XCTAssertEqual(installedTaskbarWidgetIDs(), [.stats, .battery, .timeIt, .controlCenterLights, .dateTime])
     }
 
     func testSettingsSidebarSeparatesWidgetPagesFromBarPages() {

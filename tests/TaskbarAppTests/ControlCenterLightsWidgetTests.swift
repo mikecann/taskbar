@@ -41,7 +41,7 @@ final class ControlCenterLightsWidgetTests: XCTestCase {
     }
 
     func testWidgetIsInstalledAndEnabledByDefault() {
-        XCTAssertEqual(installedTaskbarWidgetIDs(), [.stats, .battery, .controlCenterLights, .dateTime])
+        XCTAssertEqual(installedTaskbarWidgetIDs(), [.stats, .battery, .timeIt, .controlCenterLights, .dateTime])
         XCTAssertTrue(TaskbarSettingValues.defaults.controlCenterLightsWidget.isEnabled)
         XCTAssertFalse(TaskbarSettingValues.defaults.controlCenterLightsWidget.controlsTeleprompter)
         XCTAssertTrue(TaskbarSettingValues.defaults.controlCenterLightsWidget.controlsStudioDisplayScaling)

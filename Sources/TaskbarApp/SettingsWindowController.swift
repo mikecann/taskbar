@@ -684,6 +684,8 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
             renderStatsWidget(screen: screen, in: stack)
         case .battery:
             renderBatteryWidget(screen: screen, in: stack)
+        case .timeIt:
+            renderTimeItWidget(screen: screen, in: stack)
         case .controlCenterLights:
             renderControlCenterLightsWidget(screen: screen, in: stack)
         case .dateTime:
@@ -749,6 +751,32 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
                 value: values.batteryWidget,
                 enabled: true,
                 enabledAction: #selector(setGeneralBatteryEnabled(_:))
+            )
+        ))
+    }
+
+    private func renderTimeItWidget(screen: ScreenInfo?, in stack: NSStackView) {
+        if let screen {
+            let override = settings.overrides(for: screen.persistentID)
+            let resolved = settings.values(for: screen.persistentID)
+            addHeader("Time It", subtitle: "\(screen.name) override for the Time It widget.", to: stack)
+            stack.addArrangedSubview(overrideTimeItWidgetRow(
+                isOverridden: override.timeItWidget != nil,
+                value: resolved.timeItWidget
+            ))
+            return
+        }
+
+        let values = settings.preferences.general
+        addHeader("Time It", subtitle: "Default Time It widget settings used by every monitor unless that monitor has an override.", to: stack)
+        stack.addArrangedSubview(settingRow(
+            icon: "timer",
+            title: "Time It",
+            description: "Click to start Convex or stop the current timer. Requires Time It.",
+            control: timeItWidgetControls(
+                value: values.timeItWidget,
+                enabled: true,
+                enabledAction: #selector(setGeneralTimeItEnabled(_:))
             )
         ))
     }
@@ -909,6 +937,16 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
 
     private func batteryWidgetControls(
         value: BatteryWidgetSettings,
+        enabled: Bool,
+        enabledAction: Selector
+    ) -> NSView {
+        let row = horizontalRow()
+        row.addArrangedSubview(titledCheckbox("Show", state: value.isEnabled, enabled: enabled, action: enabledAction))
+        return row
+    }
+
+    private func timeItWidgetControls(
+        value: TimeItWidgetSettings,
         enabled: Bool,
         enabledAction: Selector
     ) -> NSView {
@@ -1313,6 +1351,30 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
             icon: "battery.100",
             title: "Battery",
             description: "Configure this monitor's Battery widget.",
+            control: controls
+        )
+    }
+
+    private func overrideTimeItWidgetRow(isOverridden: Bool, value: TimeItWidgetSettings) -> NSView {
+        let controls = NSStackView()
+        controls.orientation = .vertical
+        controls.alignment = .leading
+        controls.spacing = 6
+
+        let override = NSButton(checkboxWithTitle: "Override", target: self, action: #selector(toggleMonitorTimeItOverride(_:)))
+        override.state = isOverridden ? .on : .off
+        override.widthAnchor.constraint(equalToConstant: 92).isActive = true
+
+        controls.addArrangedSubview(override)
+        controls.addArrangedSubview(timeItWidgetControls(
+            value: value,
+            enabled: isOverridden,
+            enabledAction: #selector(setMonitorTimeItEnabled(_:))
+        ))
+        return settingRow(
+            icon: "timer",
+            title: "Time It",
+            description: "Configure this monitor's Time It widget.",
             control: controls
         )
     }
@@ -1741,6 +1803,10 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
         updateGeneral { $0.batteryWidget.isEnabled = sender.state == .on }
     }
 
+    @objc private func setGeneralTimeItEnabled(_ sender: NSButton) {
+        updateGeneral { $0.timeItWidget.isEnabled = sender.state == .on }
+    }
+
     @objc private func setGeneralStatsCPU(_ sender: NSButton) {
         updateGeneral { $0.statsWidget.showCPU = sender.state == .on }
     }
@@ -1870,6 +1936,13 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
         guard let id = selectedMonitorID else { return }
         let value = values(for: id).batteryWidget
         updateOverrides(for: id) { $0.batteryWidget = sender.state == .on ? value : nil }
+        renderDetail()
+    }
+
+    @objc private func toggleMonitorTimeItOverride(_ sender: NSButton) {
+        guard let id = selectedMonitorID else { return }
+        let value = values(for: id).timeItWidget
+        updateOverrides(for: id) { $0.timeItWidget = sender.state == .on ? value : nil }
         renderDetail()
     }
 
@@ -2043,8 +2116,22 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
         }
     }
 
+    private func updateMonitorTimeItWidget(_ transform: (inout TimeItWidgetSettings) -> Void) {
+        guard let id = selectedMonitorID else { return }
+        let current = overrides(for: id).timeItWidget ?? values(for: id).timeItWidget
+        updateOverrides(for: id) { override in
+            var value = current
+            transform(&value)
+            override.timeItWidget = value
+        }
+    }
+
     @objc private func setMonitorBatteryEnabled(_ sender: NSButton) {
         updateMonitorBatteryWidget { $0.isEnabled = sender.state == .on }
+    }
+
+    @objc private func setMonitorTimeItEnabled(_ sender: NSButton) {
+        updateMonitorTimeItWidget { $0.isEnabled = sender.state == .on }
     }
 
     private func updateMonitorControlCenterLightsWidget(

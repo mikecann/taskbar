@@ -88,7 +88,7 @@ final class TaskbarBatteryWidgetTests: XCTestCase {
     }
 
     func testBatteryWidgetIsInstalledBeforeDateAndTimeAndEnabledByDefault() {
-        XCTAssertEqual(installedTaskbarWidgetIDs(), [.stats, .battery, .controlCenterLights, .dateTime])
+        XCTAssertEqual(installedTaskbarWidgetIDs(), [.stats, .battery, .timeIt, .controlCenterLights, .dateTime])
         XCTAssertTrue(TaskbarSettingValues.defaults.batteryWidget.isEnabled)
         XCTAssertEqual(activeTaskbarWidgets(for: .defaults).map(\.id), [.stats, .battery, .controlCenterLights, .dateTime])
     }

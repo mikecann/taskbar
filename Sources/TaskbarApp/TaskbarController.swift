@@ -613,6 +613,12 @@ final class TaskbarController: NSObject {
             return makeStatsWidgetMenu(monitorID: monitorID)
         case .battery:
             return makeBatteryWidgetMenu(monitorID: monitorID)
+        case .timeIt:
+            let menu = NSMenu()
+            let open = NSMenuItem(title: "Open Time It", action: #selector(openTimeItFromMenu), keyEquivalent: "")
+            open.target = self
+            menu.addItem(open)
+            return menu
         case .controlCenterLights:
             return makeControlCenterLightsWidgetMenu(monitorID: monitorID)
         case .dateTime:
@@ -667,8 +673,31 @@ final class TaskbarController: NSObject {
                     updateDisplayScaling()
                 }
             }
+        case .timeIt:
+            openTimeIt(command: "toggle")
         case .battery, .dateTime:
             break
+        }
+    }
+
+    @objc private func openTimeItFromMenu() { openTimeIt(command: "open") }
+
+    private func openTimeIt(command: String) {
+        let appURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications/Time It.app")
+        guard FileManager.default.fileExists(atPath: appURL.path),
+              let url = URL(string: "time-it://\(command)") else {
+            let alert = NSAlert()
+            alert.messageText = "Install Time It first"
+            alert.informativeText = "Run restart.sh in your Time It checkout to install the timer app."
+            alert.runModal()
+            return
+        }
+        // Target the expected app explicitly rather than whichever app registered this URL scheme last.
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = command == "open"
+        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: configuration) { _, error in
+            if let error { log("Time It could not open: \(error.localizedDescription)") }
         }
     }
 

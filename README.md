@@ -217,3 +217,9 @@ folder for reference. The real app is now the Swift package under
 You can find my other tools at [mikerosoft.app](https://mikerosoft.app).
 
 MIT licensed.
+
+Time It is available as an optional timer widget. Enable it under Widgets > Time It
+in taskbar settings after installing [Time It](https://github.com/mikecann/time-it).
+Click to start Convex or stop the current timer, and right-click to open its window.
+The widget reads a small local status file; Time It owns all recording and sync.
+It stays off by default so existing taskbar layouts keep their current widths.
