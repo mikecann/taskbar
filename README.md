@@ -20,9 +20,11 @@ It has a few little widgets too, like the date and time, battery, CPU and networ
 
 Paste this into your AI coding agent (Claude Code, Codex, Cursor...):
 
-> Clone https://github.com/mikecann/taskbar and make it my own. It's one of Mike
-> Cann's personal tools, so read the README first, change anything specific to his
-> setup to suit mine, then help me get it running.
+> Fork https://github.com/mikecann/taskbar to my GitHub account and clone my fork
+> (if I don't use GitHub, or want to keep my copy private, just clone it instead),
+> then make it my own. It's one of Mike Cann's personal tools, so read the README
+> first, change anything specific to his setup to suit mine, then help me get it
+> running.
 
 ### Or set it up by hand
 
