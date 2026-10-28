@@ -205,3 +205,42 @@ func drawTaskbarText(
     ]
     (value as NSString).draw(in: rect, withAttributes: attributes)
 }
+
+func taskbarItemShowsPinMarker(_ item: TaskbarItem) -> Bool {
+    item.isPinned
+}
+
+/// Pinned items get a small pin on the bottom-left corner of their icon, so
+/// they still read as pinned once they have windows and labels. The Dock
+/// badge owns the top-right corner, so the two never collide.
+func taskbarPinMarkerRect(in iconRect: NSRect) -> NSRect? {
+    guard iconRect.width >= 16 else { return nil }
+    let size = (iconRect.width * 0.46).rounded()
+    // Overhang the icon slightly, the same way the badge does.
+    return NSRect(x: iconRect.minX - 2, y: iconRect.minY - 2, width: size, height: size)
+}
+
+func drawTaskbarPinMarker(in iconRect: NSRect) {
+    guard let rect = taskbarPinMarkerRect(in: iconRect) else { return }
+
+    // A dark disc with a hairline edge reads on both the dark bar and the
+    // light selected tile.
+    let disc = NSBezierPath(ovalIn: rect)
+    NSColor(calibratedWhite: 0.16, alpha: 0.95).setFill()
+    disc.fill()
+    NSColor(calibratedWhite: 1.0, alpha: 0.35).setStroke()
+    disc.lineWidth = 0.75
+    disc.stroke()
+
+    let configuration = NSImage.SymbolConfiguration(pointSize: rect.height * 0.62, weight: .bold)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [NSColor(calibratedWhite: 0.92, alpha: 1.0)]))
+    guard let symbol = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Pinned")?
+        .withSymbolConfiguration(configuration) else { return }
+    let size = symbol.size
+    symbol.draw(in: NSRect(
+        x: rect.midX - size.width / 2,
+        y: rect.midY - size.height / 2,
+        width: size.width,
+        height: size.height
+    ))
+}

@@ -294,6 +294,9 @@ final class TaskbarView: NSView {
         }
 
         drawTaskbarBadge(item.badgeLabel, in: iconRect)
+        if taskbarItemShowsPinMarker(item) {
+            drawTaskbarPinMarker(in: iconRect)
+        }
 
         guard wantsLabel else { return }
         let label = taskbarItemLabel(item)
