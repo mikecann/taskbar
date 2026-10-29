@@ -72,7 +72,7 @@ final class StatsProcessDetailsTests: XCTestCase {
             StatsProcessMember(pid: 4, name: "Helper (Renderer)", folder: "/", startedBy: nil, cpuPercent: 1, memoryBytes: 0)
         ]
 
-        let rows = statsProcessSubrows(members, value: \.cpuPercent, home: "/Users/me")
+        let rows = statsProcessSubrows(members, values: [\.cpuPercent], home: "/Users/me")
 
         XCTAssertEqual(rows.map(\.label), ["two", "one/app", "Helper (Renderer)"])
         XCTAssertEqual(rows.map(\.pids), [[3], [1, 2], [4]])
@@ -162,6 +162,38 @@ final class StatsProcessDetailsTests: XCTestCase {
 
         // Our own pid and launchd are skipped rather than signalled.
         XCTAssertTrue(quitStatsProcesses([Int(ProcessInfo.processInfo.processIdentifier), 1], force: true))
+    }
+
+    func testExecutableDisplayNameLooksPastVersionNamedBinaries() {
+        XCTAssertEqual(statsExecutableDisplayName("/Users/me/.local/share/claude/versions/2.1.312"), "claude")
+        XCTAssertEqual(statsExecutableDisplayName("/usr/bin/swift-frontend"), "swift-frontend")
+        XCTAssertEqual(statsExecutableDisplayName("/opt/tool/bin/tool.sh"), "tool")
+        XCTAssertEqual(statsExecutableDisplayName("node"), "node")
+    }
+
+    func testNettopParserSkipsLifetimeTotalsAndTimesEachBlock() {
+        var parser = StatsNettopStreamParser()
+        let start = Date(timeIntervalSince1970: 1_000)
+
+        // First block is lifetime totals, with the control bytes `script` puts in front.
+        XCTAssertEqual(parser.feed("\u{4}\u{8}\u{8},bytes_in,bytes_out,\r\napsd.387,20908531,6495667,\r\n", at: start), [])
+        XCTAssertNil(parser.flush())
+
+        // A block can arrive split across reads.
+        XCTAssertEqual(parser.feed(",bytes_in,bytes_out,\r\nScreen Sharing.36643,94", at: start.addingTimeInterval(2)), [])
+        XCTAssertEqual(parser.feed("104,0,\r\nnode.73302,1215,4362,\r\n", at: start.addingTimeInterval(2.05)), [])
+        let block = parser.flush()
+        XCTAssertEqual(block?.interval, 2)
+        XCTAssertEqual(block?.entries, [
+            .init(name: "Screen Sharing", pid: 36643, bytesIn: 94104, bytesOut: 0),
+            .init(name: "node", pid: 73302, bytesIn: 1215, bytesOut: 4362)
+        ])
+        XCTAssertNil(parser.flush(), "a block is only handed over once")
+
+        // If nothing flushed it, the next header does.
+        _ = parser.feed(",bytes_in,bytes_out,\r\napsd.387,10,20,\r\n", at: start.addingTimeInterval(4))
+        let closed = parser.feed(",bytes_in,bytes_out,\r\n", at: start.addingTimeInterval(6))
+        XCTAssertEqual(closed.map(\.entries.count), [1])
     }
 
     private static func describe(_ item: StatsProcessTableItem) -> String {

@@ -87,7 +87,12 @@ final class TaskbarStatsSamplerTests: XCTestCase {
                 backgroundQueue: queue,
                 cpuTickReader: { nil },
                 memoryReader: { nil },
-                networkCounterReader: { nil }
+                networkCounterReader: { nil },
+                processLister: { nil },
+                networkStreamFactory: { _ in
+                    executables.append("/usr/bin/nettop")
+                    return nil
+                }
             )
 
             _ = sampler.snapshot(
@@ -111,7 +116,11 @@ final class TaskbarStatsSamplerTests: XCTestCase {
             backgroundQueue: queue,
             cpuTickReader: { nil },
             memoryReader: { nil },
-            networkCounterReader: { nil }
+            networkCounterReader: { nil },
+            networkStreamFactory: { _ in
+                executables.append("/usr/bin/nettop")
+                return nil
+            }
         )
         let start = Date(timeIntervalSince1970: 1_000)
 
@@ -857,6 +866,64 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         XCTAssertEqual(swift?.cpuHistory.count, 2)
         XCTAssertEqual(swift?.cpuHistory.first ?? 0, 20, accuracy: 0.01)
         XCTAssertEqual(swift?.cpuHistory.last ?? 0, 0.4 / 3 * 100, accuracy: 0.01)
+    }
+
+    func testNetworkRowsComeFromTheStreamAndStopWhenThePopoverCloses() {
+        final class FakeStream: StatsNetworkStream {
+            var stopped = false
+            func stop() { stopped = true }
+        }
+        let stream = FakeStream()
+        var deliver: ((StatsNettopBlock) -> Void)?
+        var starts = 0
+        let sampler = TaskbarStatsSampler(
+            commandOutput: { _, _ in nil },
+            cpuTickReader: { nil },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processLister: { nil },
+            networkStreamFactory: { onBlock in
+                starts += 1
+                deliver = onBlock
+                return stream
+            },
+            processPathReader: { pid in
+                [
+                    40: "/Applications/Foo.app/Contents/Frameworks/Foo Helper.app/Contents/MacOS/Foo Helper",
+                    41: "/Applications/Foo.app/Contents/MacOS/Foo"
+                ][pid]
+            },
+            processDetailReader: { _, _ in nil }
+        )
+
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.networkProcesses])
+        XCTAssertEqual(starts, 1)
+        XCTAssertFalse(sampler.snapshot(now: Date(timeIntervalSince1970: 1_001), demand: [.networkProcesses]).networkProcessesSampled)
+
+        deliver?(StatsNettopBlock(entries: [
+            .init(name: "Foo Helper", pid: 40, bytesIn: 4_000, bytesOut: 1_000),
+            .init(name: "Foo", pid: 41, bytesIn: 2_000, bytesOut: 0),
+            .init(name: "curl", pid: 42, bytesIn: 500, bytesOut: 100),
+            .init(name: "idle", pid: 43, bytesIn: 0, bytesOut: 0)
+        ], interval: 2))
+        let snapshot = sampler.snapshot(now: Date(timeIntervalSince1970: 1_002), demand: [.networkProcesses])
+
+        XCTAssertEqual(starts, 1, "the stream keeps running instead of restarting")
+        XCTAssertTrue(snapshot.networkProcessesSampled)
+        let byName = Dictionary(uniqueKeysWithValues: snapshot.networkProcesses.map { ($0.name, $0) })
+        XCTAssertEqual(Set(byName.keys), ["Foo", "curl"])
+        XCTAssertEqual(byName["Foo"]?.count, 2)
+        XCTAssertEqual(byName["Foo"]?.downloadBytesPerSecond, 3_000)
+        XCTAssertEqual(byName["Foo"]?.uploadBytesPerSecond, 500)
+        XCTAssertEqual(byName["Foo"]?.pid, 40)
+        XCTAssertEqual(byName["curl"]?.downloadBytesPerSecond, 250)
+
+        // No network demand for more than five seconds stops nettop and clears the list.
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_005), demand: [])
+        XCTAssertFalse(stream.stopped)
+        let closed = sampler.snapshot(now: Date(timeIntervalSince1970: 1_008), demand: [])
+        XCTAssertTrue(stream.stopped)
+        XCTAssertTrue(closed.networkProcesses.isEmpty)
     }
 
     func testProcessCPUWaitsForAFreshBaselineAfterAGap() {

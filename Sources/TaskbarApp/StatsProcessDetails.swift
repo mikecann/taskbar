@@ -14,6 +14,8 @@ struct StatsProcessMember: Equatable {
     var memoryBytes: Double
     /// The part of cpuPercent from subprocesses that finished during the window.
     var finishedChildCPUPercent: Double = 0
+    var downloadBytesPerSecond: Double = 0
+    var uploadBytesPerSecond: Double = 0
 }
 
 /// Extra facts about a process that `ps` doesn't give us. Only readable for our own user's
@@ -31,7 +33,44 @@ struct StatsProcessSubrow: Equatable {
     var label: String
     var folder: String?
     var pids: [Int]
-    var value: Double
+    /// One value per table column (CPU, or download and upload).
+    var values: [Double]
+
+    /// What subrows sort by.
+    var value: Double { values.reduce(0, +) }
+}
+
+/// The name to show for an executable. Some tools install each release as a file named
+/// after its version (Claude Code runs as ~/.local/share/claude/versions/2.1.312), so for
+/// those the name comes from the folder above instead.
+func statsExecutableDisplayName(_ path: String) -> String {
+    let url = URL(fileURLWithPath: path)
+    let base = url.lastPathComponent
+    let looksLikeVersion = !base.isEmpty
+        && base.contains(".")
+        && base.allSatisfy { $0.isNumber || $0 == "." }
+    guard looksLikeVersion else { return url.deletingPathExtension().lastPathComponent }
+    let skipped: Set<String> = ["versions", "bin", "current", "releases", "/"]
+    return url.deletingLastPathComponent().pathComponents.reversed().first { !skipped.contains($0) } ?? base
+}
+
+/// System and app extensions (Tailscale's network extension, for one) run from bundles
+/// that aren't apps and carry reverse-DNS executable names, so use their bundle's name.
+func statsNonAppBundle(executablePath: String) -> (path: String, name: String)? {
+    guard let range = executablePath.range(of: "/Contents/MacOS/") else { return nil }
+    let bundlePath = String(executablePath[..<range.lowerBound])
+    let bundleExtension = URL(fileURLWithPath: bundlePath).pathExtension
+    guard ["systemextension", "appex", "xpc", "bundle"].contains(bundleExtension),
+          let info = Bundle(path: bundlePath)?.infoDictionary
+    else {
+        return nil
+    }
+    let candidates = [info["CFBundleDisplayName"], info["CFBundleName"]].compactMap { $0 as? String }
+    // CFBundleName is often just the bundle identifier again, which is no better.
+    guard let name = candidates.first(where: { !$0.isEmpty && ($0.contains(" ") || $0.filter { $0 == "." }.count < 2) }) else {
+        return nil
+    }
+    return (bundlePath, name)
 }
 
 private let statsInterpreterNames: Set<String> = [
@@ -182,7 +221,7 @@ func statsStableOrder(current: [String], frozen: [String]?) -> [String] {
 /// have no folder of their own, into executable names (Chrome's helper types).
 func statsProcessSubrows(
     _ members: [StatsProcessMember],
-    value: (StatsProcessMember) -> Double,
+    values: [(StatsProcessMember) -> Double],
     home: String = NSHomeDirectory()
 ) -> [StatsProcessSubrow] {
     var rows: [String: StatsProcessSubrow] = [:]
@@ -196,12 +235,14 @@ func statsProcessSubrows(
                 label: folderLabel ?? member.name,
                 folder: folderLabel == nil ? nil : member.folder,
                 pids: [],
-                value: 0
+                values: Array(repeating: 0, count: values.count)
             )
             order.append(key)
         }
         rows[key]?.pids.append(member.pid)
-        rows[key]?.value += value(member)
+        for (index, value) in values.enumerated() {
+            rows[key]?.values[index] += value(member)
+        }
     }
     return order.compactMap { rows[$0] }.sorted {
         $0.value == $1.value ? $0.label < $1.label : $0.value > $1.value
@@ -348,4 +389,148 @@ func statsProcessTableLayout(
         y += 6
     }
     return items
+}
+
+/// One interval of `nettop -P -d` output: bytes per process since the previous block.
+struct StatsNettopBlock: Equatable {
+    struct Entry: Equatable {
+        var name: String
+        var pid: Int
+        var bytesIn: Double
+        var bytesOut: Double
+    }
+
+    var entries: [Entry]
+    var interval: TimeInterval
+}
+
+/// Splits nettop's streamed CSV into blocks. Every block starts with a header line; the first
+/// block is lifetime totals rather than a delta, so it's dropped.
+struct StatsNettopStreamParser {
+    private var partialLine = ""
+    private var current: [StatsNettopBlock.Entry] = []
+    private var currentStartedAt: Date?
+    private var previousStartedAt: Date?
+    private var currentEmitted = true
+    private var headersSeen = 0
+
+    /// Feeds raw output, returning the block a new header just closed off, if any.
+    mutating func feed(_ chunk: String, at date: Date) -> [StatsNettopBlock] {
+        var blocks: [StatsNettopBlock] = []
+        let text = partialLine + chunk
+        var lines = text.components(separatedBy: "\n")
+        partialLine = lines.removeLast()
+        for rawLine in lines {
+            let line = rawLine.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+            // `script` prefixes the very first line with terminal control bytes.
+            if line.hasSuffix(",bytes_in,bytes_out,") {
+                if let block = flush() { blocks.append(block) }
+                headersSeen += 1
+                previousStartedAt = currentStartedAt
+                currentStartedAt = date
+                current = []
+                currentEmitted = false
+                continue
+            }
+            if let entry = Self.entry(from: line) {
+                current.append(entry)
+            }
+        }
+        return blocks
+    }
+
+    /// The block being read, once its rows have stopped arriving. nettop writes each block in
+    /// one burst, so the stream calls this shortly after the burst instead of waiting two
+    /// seconds for the next header.
+    mutating func flush() -> StatsNettopBlock? {
+        guard !currentEmitted, headersSeen >= 2,
+              let start = currentStartedAt, let previous = previousStartedAt
+        else {
+            return nil
+        }
+        currentEmitted = true
+        return StatsNettopBlock(entries: current, interval: min(10, max(0.5, start.timeIntervalSince(previous))))
+    }
+
+    private static func entry(from line: String) -> StatsNettopBlock.Entry? {
+        let fields = line.split(separator: ",", omittingEmptySubsequences: false)
+        guard fields.count >= 3 else { return nil }
+        let identity = String(fields[0])
+        guard let dotIndex = identity.lastIndex(of: "."),
+              let pid = Int(identity[identity.index(after: dotIndex)...]),
+              let bytesIn = Double(String(fields[1])),
+              let bytesOut = Double(String(fields[2]))
+        else {
+            return nil
+        }
+        return StatsNettopBlock.Entry(name: String(identity[..<dotIndex]), pid: pid, bytesIn: bytesIn, bytesOut: bytesOut)
+    }
+}
+
+protocol StatsNetworkStream: AnyObject {
+    func stop()
+}
+
+/// Keeps one `nettop` running while the Network popover is open. Starting it fresh for each
+/// sample cost up to five seconds under load and the list only refreshed every 15.
+final class StatsNettopStream: StatsNetworkStream {
+    private let process = Process()
+    private let queue = DispatchQueue(label: "TaskbarStats.nettop")
+    private var parser = StatsNettopStreamParser()
+    private var pendingFlush: DispatchWorkItem?
+    private let onBlock: (StatsNettopBlock) -> Void
+
+    init?(interval: Int = 2, onBlock: @escaping (StatsNettopBlock) -> Void) {
+        self.onBlock = onBlock
+        // nettop block-buffers when writing to a pipe, so everything arrived in one lump after
+        // ~16 seconds. Under `script` it sees a terminal and writes each block as it's ready.
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        process.arguments = [
+            "-q", "/dev/null", "/usr/bin/nettop",
+            "-P", "-x", "-d", "-s", String(interval), "-L", "0", "-J", "bytes_in,bytes_out"
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let output = Pipe()
+        process.standardOutput = output
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            let chunk = String(decoding: data, as: UTF8.self)
+            let now = Date()
+            self?.queue.async { self?.consume(chunk, at: now) }
+        }
+        do {
+            try process.run()
+        } catch {
+            output.fileHandleForReading.readabilityHandler = nil
+            return nil
+        }
+    }
+
+    deinit {
+        stop()
+    }
+
+    func stop() {
+        guard process.isRunning else { return }
+        // Closing `script` hangs up its terminal, which takes nettop down with it.
+        process.terminate()
+    }
+
+    private func consume(_ chunk: String, at date: Date) {
+        for block in parser.feed(chunk, at: date) {
+            onBlock(block)
+        }
+        pendingFlush?.cancel()
+        let flush = DispatchWorkItem { [weak self] in
+            guard let self, let block = self.parser.flush() else { return }
+            self.onBlock(block)
+        }
+        pendingFlush = flush
+        queue.asyncAfter(deadline: .now() + 0.2, execute: flush)
+    }
 }

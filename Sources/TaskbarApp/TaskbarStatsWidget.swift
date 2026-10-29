@@ -21,6 +21,19 @@ struct StatsProcessSample: Equatable {
     var cpuHistory: [Double] = []
     /// The part of cpuPercent that came from subprocesses which have since finished.
     var finishedChildCPUPercent: Double = 0
+    var downloadBytesPerSecond: Double = 0
+    var uploadBytesPerSecond: Double = 0
+}
+
+/// One process's numbers before grouping, from whichever source is being shown.
+struct StatsProcessEntry {
+    var pid: Int
+    var executablePath: String
+    var cpuPercent: Double = 0
+    var finishedChildCPUPercent: Double = 0
+    var memoryBytes: Double = 0
+    var downloadBytesPerSecond: Double = 0
+    var uploadBytesPerSecond: Double = 0
 }
 
 /// One process as `ps` reports it, before CPU time is turned into a rate.
@@ -85,13 +98,6 @@ func statsProcessWindowCPUSeconds(
     return result
 }
 
-struct StatsNetworkProcessSample: Equatable {
-    var pid: Int
-    var name: String
-    var appPath: String
-    var uploadBytesPerSecond: Double
-    var downloadBytesPerSecond: Double
-}
 
 private struct StatsGPUReading {
     var percent: Double
@@ -142,7 +148,10 @@ struct StatsSnapshot: Equatable {
     /// CPU the live process list can't account for: kernel_task (which `ps` hides) and
     /// processes that started and exited between samples, like short compiler jobs.
     var unattributedProcessCPUPercent: Double = 0
-    var networkProcesses: [StatsNetworkProcessSample]
+    var networkProcesses: [StatsProcessSample]
+    /// True once nettop has delivered a block, so an empty list means "nothing is using the
+    /// network" rather than "still sampling".
+    var networkProcessesSampled = false
 
     static let empty = StatsSnapshot(
         cpuPercent: 0,
@@ -586,6 +595,12 @@ func readStatsLocalProcesses() -> StatsLocalProcessList? {
     return StatsLocalProcessList(readings: readings, unreadablePIDs: unreadable)
 }
 
+func readStatsProcessPath(pid: Int) -> String? {
+    var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(pid_t(pid), &buffer, UInt32(buffer.count)) > 0 else { return nil }
+    return String(cString: buffer)
+}
+
 func statsMachTicksToSeconds(_ ticks: UInt64) -> Double {
     Double(ticks) * Double(statsMachTimebase.numer) / Double(statsMachTimebase.denom) / 1_000_000_000
 }
@@ -674,10 +689,8 @@ final class TaskbarStatsSampler {
     private var lastRefresh = Date.distantPast
     private var lastGPURefresh = Date.distantPast
     private var lastProcessRefresh = Date.distantPast
-    private var lastNetworkProcessRefresh = Date.distantPast
     private var isRefreshingGPU = false
     private var isRefreshingProcesses = false
-    private var isRefreshingNetworkProcesses = false
     private var previousCPUTicks: [UInt32]?
     private var previousCPUProcessorTicks: [[UInt32]]?
     private var previousNetwork: (counters: [String: NetworkInterfaceCounters], date: Date)?
@@ -692,7 +705,15 @@ final class TaskbarStatsSampler {
     // Only touched by the process capture, which never overlaps itself.
     private var processDetailCache: [Int: (details: StatsProcessDetails?, readAt: Date)] = [:]
     private var processCPUHistory: [String: [Double]] = [:]
-    private var cachedNetworkProcesses: [StatsNetworkProcessSample] = []
+    private var cachedNetworkProcesses: [StatsProcessSample] = []
+    private let networkStreamFactory: (@escaping (StatsNettopBlock) -> Void) -> StatsNetworkStream?
+    private let processPathReader: (Int) -> String?
+    private var networkStream: StatsNetworkStream?
+    private var networkProcessesSampled = false
+    private var lastNetworkDemand = Date.distantPast
+    private var lastNetworkStreamAttempt = Date.distantPast
+    // Only touched on the nettop stream's queue.
+    private var networkDetailCache: [Int: (details: StatsProcessDetails?, readAt: Date)] = [:]
 
     init(
         commandOutput: @escaping StatsCommandOutput = { executable, arguments in
@@ -711,6 +732,10 @@ final class TaskbarStatsSampler {
         processorCount: Int = ProcessInfo.processInfo.activeProcessorCount,
         processUsageReader: @escaping (Int) -> StatsProcessUsage? = readStatsProcessUsage,
         processLister: @escaping () -> StatsLocalProcessList? = readStatsLocalProcesses,
+        networkStreamFactory: @escaping (@escaping (StatsNettopBlock) -> Void) -> StatsNetworkStream? = { onBlock in
+            StatsNettopStream(onBlock: onBlock)
+        },
+        processPathReader: @escaping (Int) -> String? = readStatsProcessPath,
         processDetailReader: @escaping (Int, String) -> StatsProcessDetails? = readStatsProcessDetails
     ) {
         self.commandOutput = commandOutput
@@ -725,10 +750,13 @@ final class TaskbarStatsSampler {
         self.processorCount = max(1, processorCount)
         self.processUsageReader = processUsageReader
         self.processLister = processLister
+        self.networkStreamFactory = networkStreamFactory
+        self.processPathReader = processPathReader
         self.processDetailReader = processDetailReader
     }
 
     deinit {
+        networkStream?.stop()
         hostPortReleaser(hostPort)
     }
 
@@ -743,9 +771,21 @@ final class TaskbarStatsSampler {
         let shouldRefreshProcesses = demand.contains(.processes)
             && now.timeIntervalSince(lastProcessRefresh) >= processRefreshInterval
             && !isRefreshingProcesses
-        let shouldRefreshNetworkProcesses = demand.contains(.networkProcesses)
-            && now.timeIntervalSince(lastNetworkProcessRefresh) >= 15.0
-            && !isRefreshingNetworkProcesses
+        // Per-process network comes from a long-running nettop, kept going while the popover
+        // asks for it and stopped a few seconds after it stops asking.
+        var shouldStartNetworkStream = false
+        if demand.contains(.networkProcesses) {
+            lastNetworkDemand = now
+            if networkStream == nil, now.timeIntervalSince(lastNetworkStreamAttempt) >= 10 {
+                lastNetworkStreamAttempt = now
+                shouldStartNetworkStream = true
+            }
+        } else if networkStream != nil, now.timeIntervalSince(lastNetworkDemand) > 5 {
+            networkStream?.stop()
+            networkStream = nil
+            cachedNetworkProcesses = []
+            networkProcessesSampled = false
+        }
 
         if shouldRefreshGPU {
             isRefreshingGPU = true
@@ -755,10 +795,6 @@ final class TaskbarStatsSampler {
             isRefreshingProcesses = true
             lastProcessRefresh = now
         }
-        if shouldRefreshNetworkProcesses {
-            isRefreshingNetworkProcesses = true
-            lastNetworkProcessRefresh = now
-        }
 
         if now.timeIntervalSince(lastRefresh) < 0.75 {
             let snapshot = cachedSnapshot
@@ -767,7 +803,7 @@ final class TaskbarStatsSampler {
             refreshDemandedSubprocesses(
                 gpu: shouldRefreshGPU,
                 processes: shouldRefreshProcesses,
-                networkProcesses: shouldRefreshNetworkProcesses,
+                networkProcesses: shouldStartNetworkStream,
                 gpuFallback: gpuFallback,
                 now: now
             )
@@ -831,7 +867,8 @@ final class TaskbarStatsSampler {
             networkDownloadHistory: downloadHistory,
             processes: processes,
             unattributedProcessCPUPercent: cachedUnattributedProcessCPU,
-            networkProcesses: networkProcesses
+            networkProcesses: networkProcesses,
+            networkProcessesSampled: networkProcessesSampled
         )
         lastRefresh = now
         let snapshot = cachedSnapshot
@@ -841,7 +878,7 @@ final class TaskbarStatsSampler {
         refreshDemandedSubprocesses(
             gpu: shouldRefreshGPU,
             processes: shouldRefreshProcesses,
-            networkProcesses: shouldRefreshNetworkProcesses,
+            networkProcesses: shouldStartNetworkStream,
             gpuFallback: gpuFallback,
             now: now
         )
@@ -863,7 +900,7 @@ final class TaskbarStatsSampler {
             refreshProcessesInBackground(now: now)
         }
         if networkProcesses {
-            refreshNetworkProcessesInBackground()
+            startNetworkStream()
         }
     }
 
@@ -1022,16 +1059,40 @@ final class TaskbarStatsSampler {
         return (upload: rates.upload, download: rates.download)
     }
 
-    private func refreshNetworkProcessesInBackground() {
-        backgroundQueue.async { [weak self] in
-            guard let self else { return }
-            let samples = Self.captureNetworkProcesses(commandOutput: self.commandOutput)
-
-            self.lock.lock()
-            self.cachedNetworkProcesses = samples
-            self.isRefreshingNetworkProcesses = false
-            self.lock.unlock()
+    private func startNetworkStream() {
+        let stream = networkStreamFactory { [weak self] block in
+            self?.publishNetworkBlock(block)
         }
+        lock.lock()
+        networkStream = stream
+        lock.unlock()
+    }
+
+    private func publishNetworkBlock(_ block: StatsNettopBlock) {
+        let entries = block.entries.compactMap { entry -> StatsProcessEntry? in
+            guard entry.bytesIn + entry.bytesOut > 0 else { return nil }
+            return StatsProcessEntry(
+                pid: entry.pid,
+                // nettop cuts names at 15 characters ("Google Chrome H"), so prefer the real path.
+                executablePath: processPathReader(entry.pid) ?? entry.name,
+                downloadBytesPerSecond: entry.bytesIn / block.interval,
+                uploadBytesPerSecond: entry.bytesOut / block.interval
+            )
+        }
+        let details = cachedProcessDetails(
+            for: entries.map { ($0.pid, $0.executablePath) },
+            cache: &networkDetailCache,
+            now: Date()
+        )
+        let processes = Self.groupProcessEntries(entries, details: details, executableNames: [:])
+
+        lock.lock()
+        // A block can land just after the popover closed and the stream was stopped.
+        if networkStream != nil {
+            cachedNetworkProcesses = processes
+            networkProcessesSampled = true
+        }
+        lock.unlock()
     }
 
     private func refreshGPUInBackground(fallback: StatsGPUReading) {
@@ -1114,7 +1175,11 @@ final class TaskbarStatsSampler {
                     previous: baseline.readings,
                     capacitySeconds: elapsed * Double(self.processorCount),
                     footprint: { usage[$0]?.footprintBytes },
-                    details: self.cachedProcessDetails(for: readings, now: now)
+                    details: self.cachedProcessDetails(
+                        for: readings.map { ($0.pid, $0.executablePath) },
+                        cache: &self.processDetailCache,
+                        now: now
+                    )
                 )
                 processes = self.attachingCPUHistory(to: processes)
                 if let ticks, let total = cpuUsage(currentTicks: ticks, previousTicks: baseline.ticks)?.activePercent {
@@ -1131,22 +1196,26 @@ final class TaskbarStatsSampler {
     }
 
     /// Details change rarely, so each pid is re-read at most every 30 seconds.
-    private func cachedProcessDetails(for readings: [StatsProcessReading], now: Date) -> [Int: StatsProcessDetails] {
+    private func cachedProcessDetails(
+        for processes: [(pid: Int, executablePath: String)],
+        cache: inout [Int: (details: StatsProcessDetails?, readAt: Date)],
+        now: Date
+    ) -> [Int: StatsProcessDetails] {
         var fresh: [Int: (details: StatsProcessDetails?, readAt: Date)] = [:]
         var result: [Int: StatsProcessDetails] = [:]
-        for reading in readings {
-            let cached = processDetailCache[reading.pid]
+        for process in processes {
+            let cached = cache[process.pid]
             let entry: (details: StatsProcessDetails?, readAt: Date)
             if let cached, now.timeIntervalSince(cached.readAt) < 30, now >= cached.readAt {
                 entry = cached
             } else {
-                let executableName = URL(fileURLWithPath: reading.executablePath).lastPathComponent
-                entry = (processDetailReader(reading.pid, executableName), now)
+                let executableName = URL(fileURLWithPath: process.executablePath).lastPathComponent
+                entry = (processDetailReader(process.pid, executableName), now)
             }
-            fresh[reading.pid] = entry
-            result[reading.pid] = entry.details
+            fresh[process.pid] = entry
+            result[process.pid] = entry.details
         }
-        processDetailCache = fresh
+        cache = fresh
         return result
     }
 
@@ -1169,6 +1238,30 @@ final class TaskbarStatsSampler {
         footprint: (Int) -> Double?,
         details: [Int: StatsProcessDetails] = [:]
     ) -> [StatsProcessSample] {
+        let windowCPU = statsProcessWindowCPUSeconds(current: readings, previous: previous)
+        let entries = readings.map { reading -> StatsProcessEntry in
+            let window = windowCPU[reading.pid] ?? (0, 0)
+            return StatsProcessEntry(
+                pid: reading.pid,
+                executablePath: reading.executablePath,
+                cpuPercent: clampedPercent(window.total / capacitySeconds * 100),
+                finishedChildCPUPercent: clampedPercent(window.fromChildren / capacitySeconds * 100),
+                memoryBytes: footprint(reading.pid) ?? reading.memoryBytes
+            )
+        }
+        let executableNames = uniquePositiveProcessLookup(readings.map {
+            ($0.pid, statsExecutableDisplayName($0.executablePath))
+        })
+        return groupProcessEntries(entries, details: details, executableNames: executableNames)
+    }
+
+    /// Merges processes into rows: app helpers under their app, interpreters by script,
+    /// everything else by executable name.
+    private static func groupProcessEntries(
+        _ entries: [StatsProcessEntry],
+        details: [Int: StatsProcessDetails],
+        executableNames: [Int: String]
+    ) -> [StatsProcessSample] {
         let runningApps = uniquePositiveProcessLookup(
             NSWorkspace.shared.runningApplications.map { (Int($0.processIdentifier), $0) }
         )
@@ -1178,75 +1271,79 @@ final class TaskbarStatsSampler {
                 appNamesByBundlePath[path] = appNamesByBundlePath[path] ?? name
             }
         }
-        let executableNames = uniquePositiveProcessLookup(readings.map {
-            ($0.pid, URL(fileURLWithPath: $0.executablePath).lastPathComponent)
-        })
 
-        let windowCPU = statsProcessWindowCPUSeconds(current: readings, previous: previous)
         var groups: [String: StatsProcessSample] = [:]
-        var topMemberCPU: [String: Double] = [:]
-        for reading in readings {
-            let window = windowCPU[reading.pid] ?? (0, 0)
-            let cpu = clampedPercent(window.total / capacitySeconds * 100)
-            let finishedChildCPU = clampedPercent(window.fromChildren / capacitySeconds * 100)
-            let memory = footprint(reading.pid) ?? reading.memoryBytes
-            let detail = details[reading.pid]
-            let executableName = URL(fileURLWithPath: reading.executablePath).deletingPathExtension().lastPathComponent
+        var topMemberWeight: [String: Double] = [:]
+        for entry in entries {
+            let detail = details[entry.pid]
+            let executableName = statsExecutableDisplayName(entry.executablePath)
+            let weight = entry.cpuPercent + entry.downloadBytesPerSecond + entry.uploadBytesPerSecond
 
             let name: String
             let appPath: String
             let memberName: String
-            if let bundlePath = statsProcessBundlePath(executablePath: reading.executablePath) {
+            if let bundlePath = statsProcessBundlePath(executablePath: entry.executablePath) {
                 appPath = bundlePath
                 name = appNamesByBundlePath[bundlePath]
                     ?? URL(fileURLWithPath: bundlePath).deletingPathExtension().lastPathComponent
                 memberName = executableName
             } else {
-                let app = runningApps[reading.pid]
-                appPath = app?.bundleURL?.path ?? reading.executablePath
+                let app = runningApps[entry.pid]
+                let otherBundle = statsNonAppBundle(executablePath: entry.executablePath)
+                appPath = app?.bundleURL?.path
+                    ?? otherBundle?.path
+                    ?? (entry.executablePath.hasPrefix("/") ? entry.executablePath : "")
                 let interpreterLabel = detail?.arguments.flatMap {
-                    statsInterpreterLabel(executableName: executableName, arguments: $0)
+                    statsInterpreterLabel(executableName: URL(fileURLWithPath: entry.executablePath).lastPathComponent, arguments: $0)
                 }
-                name = app?.localizedName ?? interpreterLabel ?? executableName
+                name = app?.localizedName ?? otherBundle?.name ?? interpreterLabel ?? executableName
                 memberName = name
             }
             let startedBy = detail?.responsiblePID.flatMap { pid in
-                runningApps[pid]?.localizedName ?? executableNames[pid]
+                runningApps[pid]?.localizedName
+                    ?? executableNames[pid]
+                    ?? readStatsProcessPath(pid: pid).map(statsExecutableDisplayName)
             }
             let member = StatsProcessMember(
-                pid: reading.pid,
+                pid: entry.pid,
                 name: memberName,
                 folder: detail?.folder,
                 startedBy: startedBy,
-                cpuPercent: cpu,
-                memoryBytes: memory,
-                finishedChildCPUPercent: finishedChildCPU
+                cpuPercent: entry.cpuPercent,
+                memoryBytes: entry.memoryBytes,
+                finishedChildCPUPercent: entry.finishedChildCPUPercent,
+                downloadBytesPerSecond: entry.downloadBytesPerSecond,
+                uploadBytesPerSecond: entry.uploadBytesPerSecond
             )
 
             let key = appPath.hasSuffix(".app") ? appPath : name
             if var group = groups[key] {
-                group.cpuPercent += cpu
-                group.finishedChildCPUPercent += finishedChildCPU
-                group.memoryBytes += memory
+                group.cpuPercent += entry.cpuPercent
+                group.finishedChildCPUPercent += entry.finishedChildCPUPercent
+                group.memoryBytes += entry.memoryBytes
+                group.downloadBytesPerSecond += entry.downloadBytesPerSecond
+                group.uploadBytesPerSecond += entry.uploadBytesPerSecond
                 group.count += 1
                 group.members.append(member)
-                if cpu > topMemberCPU[key] ?? 0 {
-                    group.pid = reading.pid
-                    topMemberCPU[key] = cpu
+                if weight > topMemberWeight[key] ?? 0 {
+                    group.pid = entry.pid
+                    topMemberWeight[key] = weight
                 }
                 groups[key] = group
             } else {
                 groups[key] = StatsProcessSample(
-                    pid: reading.pid,
+                    pid: entry.pid,
                     name: name,
                     appPath: appPath,
-                    cpuPercent: cpu,
-                    memoryBytes: memory,
+                    cpuPercent: entry.cpuPercent,
+                    memoryBytes: entry.memoryBytes,
                     key: key,
                     members: [member],
-                    finishedChildCPUPercent: finishedChildCPU
+                    finishedChildCPUPercent: entry.finishedChildCPUPercent,
+                    downloadBytesPerSecond: entry.downloadBytesPerSecond,
+                    uploadBytesPerSecond: entry.uploadBytesPerSecond
                 )
-                topMemberCPU[key] = cpu
+                topMemberWeight[key] = weight
             }
         }
         return groups.values.map { group in
@@ -1256,72 +1353,18 @@ final class TaskbarStatsSampler {
         }
     }
 
-    /// The starter with the most CPU behind it (or the most processes when all are idle).
+    /// The starter with the most CPU or traffic behind it (or the most processes when idle).
     private static func dominantStarter(of members: [StatsProcessMember], excluding name: String) -> String? {
         var weights: [String: (cpu: Double, count: Int)] = [:]
         for member in members {
             guard let starter = member.startedBy, starter != name else { continue }
             let current = weights[starter] ?? (0, 0)
-            weights[starter] = (current.cpu + member.cpuPercent, current.count + 1)
+            let weight = member.cpuPercent + member.downloadBytesPerSecond + member.uploadBytesPerSecond
+            weights[starter] = (current.cpu + weight, current.count + 1)
         }
         return weights.max {
             ($0.value.cpu, $0.value.count, $1.key) < ($1.value.cpu, $1.value.count, $0.key)
         }?.key
-    }
-
-    private static func captureNetworkProcesses(commandOutput: StatsCommandOutput) -> [StatsNetworkProcessSample] {
-        guard let output = commandOutput(
-            "/usr/bin/nettop",
-            ["-P", "-x", "-d", "-s", "1", "-L", "2", "-J", "bytes_in,bytes_out"]
-        ) else {
-            return []
-        }
-
-        let lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard let headerIndex = lines.lastIndex(where: { $0 == ",bytes_in,bytes_out," }) else {
-            return []
-        }
-
-        let runningApps = uniquePositiveProcessLookup(
-            NSWorkspace.shared.runningApplications.map { (Int($0.processIdentifier), $0) }
-        )
-
-        return lines
-            .dropFirst(headerIndex + 1)
-            .compactMap { line -> StatsNetworkProcessSample? in
-                let fields = line.split(separator: ",", omittingEmptySubsequences: false)
-                guard fields.count >= 3 else { return nil }
-
-                let identity = String(fields[0])
-                guard let dotIndex = identity.lastIndex(of: ".") else { return nil }
-                let rawName = String(identity[..<dotIndex])
-                guard let pid = Int(identity[identity.index(after: dotIndex)...]),
-                      let download = Double(String(fields[1])),
-                      let upload = Double(String(fields[2]))
-                else {
-                    return nil
-                }
-
-                let total = upload + download
-                guard total > 0 else { return nil }
-
-                let app = runningApps[pid]
-                let appPath = app?.bundleURL?.path ?? ""
-                let name = app?.localizedName ?? rawName
-                return StatsNetworkProcessSample(
-                    pid: pid,
-                    name: name,
-                    appPath: appPath,
-                    uploadBytesPerSecond: max(0, upload),
-                    downloadBytesPerSecond: max(0, download)
-                )
-            }
-            .sorted {
-                ($0.uploadBytesPerSecond + $0.downloadBytesPerSecond) >
-                    ($1.uploadBytesPerSecond + $1.downloadBytesPerSecond)
-            }
-            .prefix(8)
-            .map { $0 }
     }
 
     private static func numericValue(for key: String, in text: String) -> Double? {
@@ -2229,10 +2272,13 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
         drawSectionTitle("TOP PROCESSES", y: 584, in: bounds)
         drawProcessTable(
             processes: topCPUProcesses(snapshot),
-            value: { $0.cpuPercent },
-            // Live time per folder; finished subprocesses get their own line below.
-            memberValue: { $0.cpuPercent - $0.finishedChildCPUPercent },
-            format: formattedStatsSharePercent,
+            columns: [StatsTableColumn(
+                title: "Usage",
+                value: { $0.cpuPercent },
+                // Live time per folder; finished subprocesses get their own line below.
+                memberValue: { $0.cpuPercent - $0.finishedChildCPUPercent },
+                format: formattedStatsSharePercent
+            )],
             showsHistory: true,
             y: 618,
             in: bounds
@@ -2282,9 +2328,12 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
         drawSectionTitle("TOP PROCESSES", y: 602, in: bounds)
         drawProcessTable(
             processes: topMemoryProcesses(snapshot),
-            value: { $0.memoryBytes },
-            memberValue: { $0.memoryBytes },
-            format: formattedStatsMemoryBytes,
+            columns: [StatsTableColumn(
+                title: "Usage",
+                value: { $0.memoryBytes },
+                memberValue: { $0.memoryBytes },
+                format: formattedStatsMemoryBytes
+            )],
             showsHistory: false,
             y: 636,
             in: bounds
@@ -2349,12 +2398,34 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
             in: NSRect(x: 18, y: 214, width: bounds.width - 36, height: 124)
         )
 
-        drawSectionTitle("CURRENT RATES", y: 366, in: bounds)
-        drawDetailRow(label: "Upload:", value: formattedStatsBytesPerSecond(snapshot.networkUploadBytesPerSecond), color: .systemRed, y: 394, in: bounds)
-        drawDetailRow(label: "Download:", value: formattedStatsBytesPerSecond(snapshot.networkDownloadBytesPerSecond), color: .systemBlue, y: 424, in: bounds)
-
-        drawSectionTitle("TOP PROCESSES", y: 480, in: bounds)
-        drawNetworkProcessTable(snapshot.networkProcesses, y: 514, in: bounds)
+        // The download and upload figures are already at the top, so the list gets the room
+        // the old "Current rates" rows took.
+        drawSectionTitle("TOP PROCESSES", y: 366, in: bounds)
+        drawProcessTable(
+            processes: Array(snapshot.networkProcesses
+                .sorted { ($0.downloadBytesPerSecond + $0.uploadBytesPerSecond) > ($1.downloadBytesPerSecond + $1.uploadBytesPerSecond) }
+                .prefix(30)),
+            columns: [
+                StatsTableColumn(
+                    title: "Down",
+                    color: .systemBlue,
+                    value: { $0.downloadBytesPerSecond },
+                    memberValue: { $0.downloadBytesPerSecond },
+                    format: formattedStatsBytesPerSecond
+                ),
+                StatsTableColumn(
+                    title: "Up",
+                    color: .systemRed,
+                    value: { $0.uploadBytesPerSecond },
+                    memberValue: { $0.uploadBytesPerSecond },
+                    format: formattedStatsBytesPerSecond
+                )
+            ],
+            showsHistory: false,
+            emptyText: snapshot.networkProcessesSampled ? "Nothing is using the network" : "Sampling network processes...",
+            y: 400,
+            in: bounds
+        )
     }
 
     private func topCPUProcesses(_ snapshot: StatsSnapshot) -> [StatsProcessSample] {
@@ -2555,7 +2626,7 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
         let maxValue = roundedChartMax(max(upload.max() ?? 0, download.max() ?? 0, 1))
         drawChart(
             series: [
-                (values: download, color: .systemGreen, fillAlpha: 0.22),
+                (values: download, color: .systemBlue, fillAlpha: 0.22),
                 (values: upload, color: .systemRed, fillAlpha: 0.18)
             ],
             in: rect,
@@ -2712,23 +2783,38 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
 
     private func drawProcessTable(
         processes: [StatsProcessSample],
-        valueTitle: String = "Usage",
-        value: (StatsProcessSample) -> Double,
-        memberValue: (StatsProcessMember) -> Double,
-        format: (Double) -> String,
+        columns: [StatsTableColumn],
         showsHistory: Bool,
+        emptyText: String = "Sampling processes...",
         y: CGFloat,
         in bounds: NSRect
     ) {
         let dim = NSColor(calibratedWhite: 0.56, alpha: 1)
+        // Columns sit flush right; one wide column, or narrower ones side by side.
+        let columnWidth: CGFloat = columns.count == 1 ? 100 : 62
+        let columnRects = columns.indices.map { index -> NSRect in
+            let fromRight = CGFloat(columns.count - index)
+            return NSRect(x: bounds.width - 24 - fromRight * columnWidth, y: 0, width: columnWidth, height: 0)
+        }
+        let valueFontSize: CGFloat = columns.count == 1 ? 14 : 12.5
+        // Two value columns leave little room, so the "×3" count squeezes up to them.
+        let countWidth: CGFloat = columns.count == 1 ? 40 : 28
+        let countX = (columnRects.first?.minX ?? bounds.width - 124) - countWidth - 4
+        let nameWidth = countX - 54
+        let value: (StatsProcessSample) -> Double = { row in columns.reduce(0) { $0 + $1.value(row) } }
+
         drawStatsText("Process", in: NSRect(x: 60, y: y, width: 160, height: 18), size: 12, weight: .semibold, color: dim)
-        drawRightAlignedText(
-            valueTitle,
-            in: NSRect(x: bounds.width - 116, y: y, width: 92, height: 18),
-            size: 12,
-            weight: .semibold,
-            color: dim
-        )
+        for (column, rect) in zip(columns, columnRects) {
+            let header = NSRect(x: rect.minX, y: y, width: rect.width, height: 18)
+            if let color = column.color {
+                // Same colour key as the Download and Upload figures at the top.
+                color.withAlphaComponent(0.9).setFill()
+                NSBezierPath(roundedRect: NSRect(x: header.maxX - 12, y: y + 3, width: 10, height: 10), xRadius: 3, yRadius: 3).fill()
+                drawRightAlignedText(column.title, in: header.offsetBy(dx: -16, dy: 0), size: 12, weight: .semibold, color: dim)
+            } else {
+                drawRightAlignedText(column.title, in: header, size: 12, weight: .semibold, color: dim)
+            }
+        }
 
         let tableTop = y + 28
         let tableBottom = bounds.height - 24
@@ -2738,7 +2824,7 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
             processTableItems = []
             processRowsByKey = [:]
             drawStatsText(
-                "Sampling processes...",
+                emptyText,
                 in: NSRect(x: 60, y: y + 32, width: bounds.width - 84, height: 20),
                 size: 14,
                 weight: .medium,
@@ -2760,14 +2846,14 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
         }
         let expandedRow = expandedProcessKey.flatMap { processRowsByKey[$0] }
         expandedSubrows = expandedRow.map { row in
-            var subrows = statsProcessSubrows(row.members, value: memberValue)
+            var subrows = statsProcessSubrows(row.members, values: columns.map(\.memberValue))
             if showsHistory, row.finishedChildCPUPercent >= 0.1 {
                 subrows.append(StatsProcessSubrow(
                     key: Self.finishedSubrowKey,
                     label: "Finished subprocesses",
                     folder: nil,
                     pids: row.members.filter { $0.finishedChildCPUPercent > 0 }.map(\.pid),
-                    value: row.finishedChildCPUPercent
+                    values: [row.finishedChildCPUPercent]
                 ))
                 subrows.sort { $0.value > $1.value }
             }
@@ -2797,7 +2883,6 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
         }
 
         let hovered = hoverPoint.flatMap { point in items.first { $0.rect.contains(point) } }
-        let valueRectX = bounds.width - 124
 
         // One soft panel behind the expanded row and everything under it.
         if let expandedProcessKey {
@@ -2842,7 +2927,7 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
                 }
                 drawStatsText(
                     process.name,
-                    in: NSRect(x: 52, y: rowY + 3, width: bounds.width - 214, height: 20),
+                    in: NSRect(x: 52, y: rowY + 3, width: nameWidth, height: 20),
                     size: 14,
                     weight: .semibold,
                     color: key == Self.kernelRowKey ? NSColor(calibratedWhite: 0.66, alpha: 1) : NSColor(calibratedWhite: 0.86, alpha: 1)
@@ -2850,19 +2935,21 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
                 if process.count > 1 {
                     drawRightAlignedText(
                         "×\(process.count)",
-                        in: NSRect(x: bounds.width - 166, y: rowY + 4, width: 40, height: 18),
+                        in: NSRect(x: countX, y: rowY + 4, width: countWidth, height: 18),
                         size: 12,
                         weight: .medium,
                         color: dim
                     )
                 }
-                drawRightAlignedText(
-                    format(value(process)),
-                    in: NSRect(x: valueRectX, y: rowY + 3, width: 100, height: 20),
-                    size: 14,
-                    weight: .semibold,
-                    color: .white
-                )
+                for (column, columnRect) in zip(columns, columnRects) {
+                    drawRightAlignedText(
+                        column.format(column.value(process)),
+                        in: NSRect(x: columnRect.minX, y: rowY + 3 + (14 - valueFontSize) / 2, width: columnRect.width, height: 20),
+                        size: valueFontSize,
+                        weight: .semibold,
+                        color: .white
+                    )
+                }
 
             case let .detail(key, rect):
                 guard let process = processRowsByKey[key] else { continue }
@@ -2893,7 +2980,7 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
                 guard let subrow = expandedSubrows.first(where: { $0.key == subrowKey }) else { continue }
                 drawStatsText(
                     subrow.label,
-                    in: NSRect(x: 52, y: rect.minY + 3, width: bounds.width - 214, height: 18),
+                    in: NSRect(x: 52, y: rect.minY + 3, width: nameWidth, height: 18),
                     size: 13,
                     weight: .medium,
                     color: NSColor(calibratedWhite: 0.78, alpha: 1)
@@ -2901,19 +2988,21 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
                 if subrow.pids.count > 1 {
                     drawRightAlignedText(
                         "×\(subrow.pids.count)",
-                        in: NSRect(x: bounds.width - 166, y: rect.minY + 4, width: 40, height: 16),
+                        in: NSRect(x: countX, y: rect.minY + 4, width: countWidth, height: 16),
                         size: 11,
                         weight: .medium,
                         color: dim
                     )
                 }
-                drawRightAlignedText(
-                    format(subrow.value),
-                    in: NSRect(x: valueRectX, y: rect.minY + 3, width: 100, height: 18),
-                    size: 13,
-                    weight: .medium,
-                    color: NSColor(calibratedWhite: 0.86, alpha: 1)
-                )
+                for (index, columnRect) in columnRects.enumerated() where index < subrow.values.count {
+                    drawRightAlignedText(
+                        columns[index].format(subrow.values[index]),
+                        in: NSRect(x: columnRect.minX, y: rect.minY + 3, width: columnRect.width, height: 18),
+                        size: valueFontSize - 1,
+                        weight: .medium,
+                        color: NSColor(calibratedWhite: 0.86, alpha: 1)
+                    )
+                }
 
             case let .more(_, hidden, rect):
                 drawStatsText(
@@ -2998,59 +3087,6 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
             weight: .medium,
             color: NSColor(calibratedWhite: 0.56, alpha: 1)
         )
-    }
-
-    private func drawNetworkProcessTable(_ processes: [StatsNetworkProcessSample], y: CGFloat, in bounds: NSRect) {
-        drawStatsText(
-            "Process",
-            in: NSRect(x: 60, y: y, width: 160, height: 18),
-            size: 12,
-            weight: .semibold,
-            color: NSColor(calibratedWhite: 0.56, alpha: 1)
-        )
-
-        NSColor.systemBlue.withAlphaComponent(0.9).setFill()
-        NSBezierPath(roundedRect: NSRect(x: bounds.width - 112, y: y + 2, width: 12, height: 12), xRadius: 3, yRadius: 3).fill()
-        NSColor.systemRed.withAlphaComponent(0.9).setFill()
-        NSBezierPath(roundedRect: NSRect(x: bounds.width - 42, y: y + 2, width: 12, height: 12), xRadius: 3, yRadius: 3).fill()
-
-        if processes.isEmpty {
-            drawStatsText(
-                "Sampling network processes...",
-                in: NSRect(x: 60, y: y + 32, width: bounds.width - 84, height: 20),
-                size: 14,
-                weight: .medium,
-                color: NSColor(calibratedWhite: 0.72, alpha: 1)
-            )
-            return
-        }
-
-        let maxRows = max(0, min(8, Int((bounds.height - y - 56) / 26)))
-        for (index, process) in processes.prefix(maxRows).enumerated() {
-            let rowY = y + 32 + CGFloat(index) * 26
-            drawProcessIcon(path: process.appPath, in: NSRect(x: 24, y: rowY + 3, width: 15, height: 15))
-            drawStatsText(
-                process.name,
-                in: NSRect(x: 52, y: rowY, width: bounds.width - 190, height: 20),
-                size: 14,
-                weight: .semibold,
-                color: NSColor(calibratedWhite: 0.86, alpha: 1)
-            )
-            drawRightAlignedText(
-                formattedStatsBytesPerSecond(process.downloadBytesPerSecond),
-                in: NSRect(x: bounds.width - 150, y: rowY, width: 74, height: 20),
-                size: 12.5,
-                weight: .semibold,
-                color: .white
-            )
-            drawRightAlignedText(
-                formattedStatsBytesPerSecond(process.uploadBytesPerSecond),
-                in: NSRect(x: bounds.width - 74, y: rowY, width: 50, height: 20),
-                size: 12.5,
-                weight: .semibold,
-                color: .white
-            )
-        }
     }
 
     private func drawProcessIcon(path: String, in rect: NSRect) {
@@ -3273,4 +3309,14 @@ final class StatsProcessMenuHandler: NSObject {
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn
     }
+}
+
+/// One value column in a Top Processes table.
+struct StatsTableColumn {
+    var title: String
+    /// A colour key square drawn next to the title, matching the figures at the top.
+    var color: NSColor?
+    var value: (StatsProcessSample) -> Double
+    var memberValue: (StatsProcessMember) -> Double
+    var format: (Double) -> String
 }
