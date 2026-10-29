@@ -342,6 +342,7 @@ final class TaskbarController: NSObject {
     private func finishStarting() {
         focusMonitor.start()
         TaskbarBadgeSampler.shared.onChange = { [weak self] in self?.scheduleRefreshSoon(after: 0) }
+        ChromeProfileStore.shared.onChange = { [weak self] in self?.scheduleRefreshSoon(after: 0) }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -361,6 +362,7 @@ final class TaskbarController: NSObject {
         autoHideTimer?.invalidate()
         focusMonitor.stop()
         TaskbarBadgeSampler.shared.onChange = nil
+        ChromeProfileStore.shared.onChange = nil
         ControlCenterLightsController.shared.stop()
         stopObservingScreenChanges()
         settings.flushPendingPersistence()
@@ -474,7 +476,7 @@ final class TaskbarController: NSObject {
             )
             panels[screen.id]?.update(
                 screen: screen,
-                items: applyingTaskbarBadges(badges, to: items),
+                items: applyingChromeProfiles(to: applyingTaskbarBadges(badges, to: items)),
                 values: values,
                 isObscuredByFullscreenWindow: fullscreenScreenIDs.contains(screen.id)
             )

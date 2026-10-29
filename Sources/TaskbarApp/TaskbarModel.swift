@@ -95,6 +95,9 @@ struct TaskbarItem: Equatable {
     let isPinned: Bool
     let pinOrder: Int?
     var badgeLabel: String? = nil
+    /// The Chrome profile a browser window belongs to, from its title.
+    var browserProfileName: String? = nil
+    var profileBadge: TaskbarProfileBadge? = nil
 
     var identity: String {
         identityForTaskbar(bundleID: bundleID, appPath: appPath)
@@ -480,7 +483,7 @@ func buildTaskbarItems(
 
     var runningItems = windows.map { window in
             let pinOrder = pinnedByIdentity[identity(bundleID: window.bundleID, appPath: window.appPath)]
-            return TaskbarItem(
+            var item = TaskbarItem(
                 owner: window.owner,
                 pid: window.pid,
                 title: window.title.isEmpty ? window.owner : window.title,
@@ -495,6 +498,11 @@ func buildTaskbarItems(
                 isPinned: pinOrder != nil,
                 pinOrder: pinOrder
             )
+            item.browserProfileName = chromeWindowProfileName(
+                accessibilityTitle: window.accessibilityTitle,
+                bundleID: window.bundleID
+            )
+            return item
         }
 
     let representedPIDs = Set(windows.map(\.pid))
