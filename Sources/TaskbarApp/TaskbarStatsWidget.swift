@@ -209,7 +209,19 @@ struct StatsSamplingDemand: OptionSet, Equatable {
     static let gpu = StatsSamplingDemand(rawValue: 1 << 0)
     static let processes = StatsSamplingDemand(rawValue: 1 << 1)
     static let networkProcesses = StatsSamplingDemand(rawValue: 1 << 2)
+    /// Keep cheap background samples going so popovers open with a list already there.
+    static let warmProcesses = StatsSamplingDemand(rawValue: 1 << 3)
+    static let warmNetwork = StatsSamplingDemand(rawValue: 1 << 4)
     static let menuSummary: StatsSamplingDemand = [.gpu]
+
+    /// What the visible tiles' popovers need warmed up: CPU and RAM share the process list.
+    static func warmPopovers(_ settings: StatsWidgetSettings) -> StatsSamplingDemand {
+        guard settings.isEnabled else { return [] }
+        var demand: StatsSamplingDemand = []
+        if settings.showCPU || settings.showMemory { demand.insert(.warmProcesses) }
+        if settings.showNetwork { demand.insert(.warmNetwork) }
+        return demand
+    }
 
     static func visibleMetrics(_ settings: StatsWidgetSettings) -> StatsSamplingDemand {
         guard settings.isEnabled else { return [] }
@@ -314,7 +326,7 @@ struct StatsWidgetPlugin: TaskbarWidgetPlugin {
 
         let snapshot = TaskbarStatsSampler.shared.snapshot(
             now: date,
-            demand: .visibleMetrics(settings)
+            demand: StatsSamplingDemand.visibleMetrics(settings).union(.warmPopovers(settings))
         )
         let moduleRects = statsWidgetModuleRects(settings: settings, in: rect)
 
@@ -708,16 +720,28 @@ final class TaskbarStatsSampler {
     private var cachedNetworkProcesses: [StatsProcessSample] = []
     private let networkStreamFactory: (@escaping (StatsNettopBlock) -> Void) -> StatsNetworkStream?
     private let processPathReader: (Int) -> String?
+    /// Network blocks arrive on their own schedule, so they're timed with this.
+    private let clock: () -> Date
     private var networkStream: StatsNetworkStream?
     private var networkProcessesSampled = false
+    private var networkProcessesAt = Date.distantPast
+    private var processesAt = Date.distantPast
+    private var processesWereDemanded = false
+    // Lifetime network totals from the last background nettop, to turn the next set (or the
+    // stream's first block) into rates straight away.
+    private var networkTotals: (date: Date, entries: [StatsNettopBlock.Entry])?
+    private var lastNetworkTotalsRefresh = Date.distantPast
+    private var isRefreshingNetworkTotals = false
     private var lastNetworkDemand = Date.distantPast
     private var lastNetworkStreamAttempt = Date.distantPast
-    // Only touched on the nettop stream's queue.
+    // Stream blocks and background totals publish from different queues.
+    private let networkPublishLock = NSLock()
     private var networkDetailCache: [Int: (details: StatsProcessDetails?, readAt: Date)] = [:]
 
     init(
         commandOutput: @escaping StatsCommandOutput = { executable, arguments in
-            runStatsCommandOutput(executable, arguments: arguments)
+            // A one-shot nettop always takes about five seconds to finish.
+            runStatsCommandOutput(executable, arguments: arguments, timeout: executable.hasSuffix("nettop") ? 15 : 6)
         },
         backgroundQueue: DispatchQueue = DispatchQueue.global(qos: .utility),
         cpuTickReader: (() -> [UInt32]?)? = nil,
@@ -736,6 +760,7 @@ final class TaskbarStatsSampler {
             StatsNettopStream(onBlock: onBlock)
         },
         processPathReader: @escaping (Int) -> String? = readStatsProcessPath,
+        clock: @escaping () -> Date = Date.init,
         processDetailReader: @escaping (Int, String) -> StatsProcessDetails? = readStatsProcessDetails
     ) {
         self.commandOutput = commandOutput
@@ -752,6 +777,7 @@ final class TaskbarStatsSampler {
         self.processLister = processLister
         self.networkStreamFactory = networkStreamFactory
         self.processPathReader = processPathReader
+        self.clock = clock
         self.processDetailReader = processDetailReader
     }
 
@@ -765,12 +791,32 @@ final class TaskbarStatsSampler {
         let shouldRefreshGPU = demand.contains(.gpu)
             && now.timeIntervalSince(lastGPURefresh) >= 2.0
             && !isRefreshingGPU
-        // Per-process CPU needs two samples, so take the second one sooner when the
-        // popover has just opened and there's nothing to show yet.
-        let processRefreshInterval: TimeInterval = cachedProcesses.isEmpty ? 1.0 : 3.0
-        let shouldRefreshProcesses = demand.contains(.processes)
-            && now.timeIntervalSince(lastProcessRefresh) >= processRefreshInterval
+        // The popover shows whatever the background samples last found straight away, then
+        // takes a fresh sample a second after opening and every three seconds while open.
+        // Per-process CPU needs two samples, so with nothing to show it also goes quickly.
+        let processesOpen = demand.contains(.processes)
+        let justOpened = processesOpen && !processesWereDemanded
+        processesWereDemanded = processesOpen
+        let processRefreshInterval: TimeInterval?
+        if processesOpen {
+            processRefreshInterval = cachedProcesses.isEmpty || justOpened ? 1.0 : 3.0
+        } else if demand.contains(.warmProcesses) {
+            processRefreshInterval = 5.0
+        } else {
+            processRefreshInterval = nil
+        }
+        let shouldRefreshProcesses = processRefreshInterval.map { now.timeIntervalSince(lastProcessRefresh) >= $0 } ?? false
             && !isRefreshingProcesses
+        // While the Network popover is closed, a one-shot nettop every 30 seconds keeps
+        // recent rates ready. Leaving the streaming nettop running cost about 30% of a core.
+        let shouldRefreshNetworkTotals = demand.contains(.warmNetwork)
+            && networkStream == nil
+            && now.timeIntervalSince(lastNetworkTotalsRefresh) >= 30
+            && !isRefreshingNetworkTotals
+        if shouldRefreshNetworkTotals {
+            isRefreshingNetworkTotals = true
+            lastNetworkTotalsRefresh = now
+        }
         // Per-process network comes from a long-running nettop, kept going while the popover
         // asks for it and stopped a few seconds after it stops asking.
         var shouldStartNetworkStream = false
@@ -781,10 +827,9 @@ final class TaskbarStatsSampler {
                 shouldStartNetworkStream = true
             }
         } else if networkStream != nil, now.timeIntervalSince(lastNetworkDemand) > 5 {
+            // Keep the last rows: they're what the popover shows if it opens again soon.
             networkStream?.stop()
             networkStream = nil
-            cachedNetworkProcesses = []
-            networkProcessesSampled = false
         }
 
         if shouldRefreshGPU {
@@ -804,6 +849,7 @@ final class TaskbarStatsSampler {
                 gpu: shouldRefreshGPU,
                 processes: shouldRefreshProcesses,
                 networkProcesses: shouldStartNetworkStream,
+                networkTotals: shouldRefreshNetworkTotals,
                 gpuFallback: gpuFallback,
                 now: now
             )
@@ -831,8 +877,11 @@ final class TaskbarStatsSampler {
         )
         let gpu = cachedGPU
         let network = readNetworkSpeed(now: now)
-        let processes = cachedProcesses
-        let networkProcesses = cachedNetworkProcesses
+        // Background rows are only worth showing while they're recent; after a long gap (the
+        // Mac asleep, the widget hidden) the popover samples afresh instead.
+        let processes = now.timeIntervalSince(processesAt) <= 30 ? cachedProcesses : []
+        let networkFresh = now.timeIntervalSince(networkProcessesAt) <= 60
+        let networkProcesses = networkFresh ? cachedNetworkProcesses : []
 
         let cpuHistory = appendedHistory(cachedSnapshot.cpuHistory, value: cpu.activePercent)
         let gpuHistory = appendedHistory(cachedSnapshot.gpuHistory, value: gpu.percent)
@@ -868,7 +917,7 @@ final class TaskbarStatsSampler {
             processes: processes,
             unattributedProcessCPUPercent: cachedUnattributedProcessCPU,
             networkProcesses: networkProcesses,
-            networkProcessesSampled: networkProcessesSampled
+            networkProcessesSampled: networkProcessesSampled && networkFresh
         )
         lastRefresh = now
         let snapshot = cachedSnapshot
@@ -879,6 +928,7 @@ final class TaskbarStatsSampler {
             gpu: shouldRefreshGPU,
             processes: shouldRefreshProcesses,
             networkProcesses: shouldStartNetworkStream,
+            networkTotals: shouldRefreshNetworkTotals,
             gpuFallback: gpuFallback,
             now: now
         )
@@ -890,6 +940,7 @@ final class TaskbarStatsSampler {
         gpu: Bool,
         processes: Bool,
         networkProcesses: Bool,
+        networkTotals: Bool,
         gpuFallback: StatsGPUReading,
         now: Date
     ) {
@@ -901,6 +952,9 @@ final class TaskbarStatsSampler {
         }
         if networkProcesses {
             startNetworkStream()
+        }
+        if networkTotals {
+            refreshNetworkTotalsInBackground()
         }
     }
 
@@ -1068,7 +1122,43 @@ final class TaskbarStatsSampler {
         lock.unlock()
     }
 
-    private func publishNetworkBlock(_ block: StatsNettopBlock) {
+    /// One-shot lifetime totals while the popover is closed; two in a row make rates.
+    private func refreshNetworkTotalsInBackground() {
+        backgroundQueue.async { [weak self] in
+            guard let self else { return }
+            let output = self.commandOutput("/usr/bin/nettop", ["-P", "-x", "-L", "1", "-J", "bytes_in,bytes_out"])
+            let totals = output.map(parseStatsNettopTotals) ?? []
+            if !totals.isEmpty {
+                self.publishNetworkTotals(totals, at: self.clock(), fromStream: false)
+            }
+            self.lock.lock()
+            self.isRefreshingNetworkTotals = false
+            self.lock.unlock()
+        }
+    }
+
+    /// Turns fresh lifetime totals into rates against the previous set, so the list is
+    /// ready the moment the popover opens: from background totals, or from the first block
+    /// the stream sends, which arrives well before its first two-second delta.
+    private func publishNetworkTotals(_ totals: [StatsNettopBlock.Entry], at date: Date, fromStream: Bool) {
+        lock.lock()
+        let previous = networkTotals
+        networkTotals = (date, totals)
+        lock.unlock()
+
+        guard let previous else { return }
+        let elapsed = date.timeIntervalSince(previous.date)
+        guard elapsed > 0.5, elapsed <= 90 else { return }
+        publishNetworkBlock(statsNettopRates(from: previous.entries, to: totals, interval: elapsed), fromStream: fromStream)
+    }
+
+    private func publishNetworkBlock(_ block: StatsNettopBlock, fromStream: Bool = true) {
+        if block.isTotals {
+            publishNetworkTotals(block.entries, at: clock(), fromStream: fromStream)
+            return
+        }
+        networkPublishLock.lock()
+        defer { networkPublishLock.unlock() }
         let entries = block.entries.compactMap { entry -> StatsProcessEntry? in
             guard entry.bytesIn + entry.bytesOut > 0 else { return nil }
             return StatsProcessEntry(
@@ -1082,15 +1172,17 @@ final class TaskbarStatsSampler {
         let details = cachedProcessDetails(
             for: entries.map { ($0.pid, $0.executablePath) },
             cache: &networkDetailCache,
-            now: Date()
+            now: clock()
         )
         let processes = Self.groupProcessEntries(entries, details: details, executableNames: [:])
 
         lock.lock()
-        // A block can land just after the popover closed and the stream was stopped.
-        if networkStream != nil {
+        // A stream block can land just after the popover closed and the stream was stopped,
+        // and background totals shouldn't overwrite the stream's fresher rows.
+        if fromStream == (networkStream != nil) {
             cachedNetworkProcesses = processes
             networkProcessesSampled = true
+            networkProcessesAt = clock()
         }
         lock.unlock()
     }
@@ -1169,7 +1261,7 @@ final class TaskbarStatsSampler {
             var unattributed: Double = 0
             let elapsed = baseline.map { now.timeIntervalSince($0.date) } ?? 0
             // Older baselines would average over the gap since the popover was last open.
-            if let baseline, elapsed > 0, elapsed <= 10 {
+            if let baseline, elapsed > 0, elapsed <= 15 {
                 processes = Self.groupedProcesses(
                     readings: readings,
                     previous: baseline.readings,
@@ -1188,8 +1280,13 @@ final class TaskbarStatsSampler {
             }
 
             self.lock.lock()
-            self.cachedProcesses = processes
-            self.cachedUnattributedProcessCPU = unattributed
+            // A capture without a usable baseline has nothing to show; keep the last rows
+            // (they go stale after 30 seconds) rather than blanking the list.
+            if baseline != nil, elapsed > 0, elapsed <= 15 {
+                self.cachedProcesses = processes
+                self.cachedUnattributedProcessCPU = unattributed
+                self.processesAt = now
+            }
             self.isRefreshingProcesses = false
             self.lock.unlock()
         }

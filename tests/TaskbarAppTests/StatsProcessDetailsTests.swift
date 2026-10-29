@@ -171,13 +171,15 @@ final class StatsProcessDetailsTests: XCTestCase {
         XCTAssertEqual(statsExecutableDisplayName("node"), "node")
     }
 
-    func testNettopParserSkipsLifetimeTotalsAndTimesEachBlock() {
+    func testNettopParserMarksLifetimeTotalsAndTimesEachBlock() {
         var parser = StatsNettopStreamParser()
         let start = Date(timeIntervalSince1970: 1_000)
 
         // First block is lifetime totals, with the control bytes `script` puts in front.
         XCTAssertEqual(parser.feed("\u{4}\u{8}\u{8},bytes_in,bytes_out,\r\napsd.387,20908531,6495667,\r\n", at: start), [])
-        XCTAssertNil(parser.flush())
+        let totals = parser.flush()
+        XCTAssertEqual(totals?.isTotals, true)
+        XCTAssertEqual(totals?.entries.first?.bytesIn, 20_908_531)
 
         // A block can arrive split across reads.
         XCTAssertEqual(parser.feed(",bytes_in,bytes_out,\r\nScreen Sharing.36643,94", at: start.addingTimeInterval(2)), [])
@@ -194,6 +196,23 @@ final class StatsProcessDetailsTests: XCTestCase {
         _ = parser.feed(",bytes_in,bytes_out,\r\napsd.387,10,20,\r\n", at: start.addingTimeInterval(4))
         let closed = parser.feed(",bytes_in,bytes_out,\r\n", at: start.addingTimeInterval(6))
         XCTAssertEqual(closed.map(\.entries.count), [1])
+    }
+
+    func testNettopRatesSkipNewAndReusedPIDs() {
+        let earlier: [StatsNettopBlock.Entry] = [
+            .init(name: "curl", pid: 1, bytesIn: 1_000, bytesOut: 100),
+            .init(name: "old", pid: 2, bytesIn: 9_000, bytesOut: 9_000)
+        ]
+        let later: [StatsNettopBlock.Entry] = [
+            .init(name: "curl", pid: 1, bytesIn: 4_000, bytesOut: 700),
+            .init(name: "new", pid: 2, bytesIn: 10, bytesOut: 10),
+            .init(name: "started", pid: 3, bytesIn: 50_000_000, bytesOut: 0)
+        ]
+
+        let block = statsNettopRates(from: earlier, to: later, interval: 30)
+
+        XCTAssertEqual(block.entries, [.init(name: "curl", pid: 1, bytesIn: 3_000, bytesOut: 600)])
+        XCTAssertEqual(block.interval, 30)
     }
 
     private static func describe(_ item: StatsProcessTableItem) -> String {

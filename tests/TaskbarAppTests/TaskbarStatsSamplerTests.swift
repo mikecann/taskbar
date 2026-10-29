@@ -918,12 +918,96 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         XCTAssertEqual(byName["Foo"]?.pid, 40)
         XCTAssertEqual(byName["curl"]?.downloadBytesPerSecond, 250)
 
-        // No network demand for more than five seconds stops nettop and clears the list.
+        // No network demand for more than five seconds stops nettop. The rows stay, so
+        // reopening soon shows them straight away.
         _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_005), demand: [])
         XCTAssertFalse(stream.stopped)
         let closed = sampler.snapshot(now: Date(timeIntervalSince1970: 1_008), demand: [])
         XCTAssertTrue(stream.stopped)
-        XCTAssertTrue(closed.networkProcesses.isEmpty)
+        XCTAssertEqual(closed.networkProcesses.count, 2)
+    }
+
+    func testWarmProcessesFillTheListBeforeThePopoverOpens() {
+        let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.warmProcesses")
+        var psOutput = "10 1 0:10.00 100 /usr/bin/git\n"
+        var captures = 0
+        let sampler = TaskbarStatsSampler(
+            commandOutput: { executable, _ in
+                guard executable == "/bin/ps" else { return nil }
+                captures += 1
+                return psOutput
+            },
+            backgroundQueue: queue,
+            cpuTickReader: { nil },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processorCount: 1,
+            processUsageReader: { _ in nil },
+            processLister: { nil },
+            processDetailReader: { _, _ in nil }
+        )
+
+        // The taskbar tile asks for warm samples every second; they're taken every five.
+        for second in 0...5 {
+            _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000 + Double(second)), demand: [.warmProcesses])
+            queue.sync {}
+            psOutput = "10 1 0:\(10 + second + 1).00 100 /usr/bin/git\n"
+        }
+        XCTAssertEqual(captures, 2)
+
+        // Opening the popover shows the background rows at once...
+        let opened = sampler.snapshot(now: Date(timeIntervalSince1970: 1_006), demand: [.processes])
+        XCTAssertEqual(opened.processes.first?.name, "git")
+        queue.sync {}
+        // ...and takes a fresh sample a second after the last one rather than waiting three.
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_007), demand: [.processes])
+        queue.sync {}
+        XCTAssertEqual(captures, 3)
+
+        // Rows from long ago aren't shown as if they were current.
+        XCTAssertTrue(sampler.snapshot(now: Date(timeIntervalSince1970: 1_100), demand: []).processes.isEmpty)
+    }
+
+    func testWarmNetworkTurnsTwoBackgroundTotalsIntoRows() {
+        let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.warmNetwork")
+        var fakeNow = Date(timeIntervalSince1970: 1_000)
+        var totals = ",bytes_in,bytes_out,\ncurl.42,1000,100,\n"
+        var oneShots = 0
+        let sampler = TaskbarStatsSampler(
+            commandOutput: { executable, arguments in
+                guard executable == "/usr/bin/nettop", arguments.contains("-L") else { return nil }
+                oneShots += 1
+                return totals
+            },
+            backgroundQueue: queue,
+            cpuTickReader: { nil },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processLister: { nil },
+            networkStreamFactory: { _ in
+                XCTFail("the streaming nettop only runs while the popover is open")
+                return nil
+            },
+            processPathReader: { _ in nil },
+            clock: { fakeNow },
+            processDetailReader: { _, _ in nil }
+        )
+
+        _ = sampler.snapshot(now: fakeNow, demand: [.warmNetwork])
+        queue.sync {}
+        XCTAssertFalse(sampler.snapshot(now: fakeNow.addingTimeInterval(1), demand: []).networkProcessesSampled)
+
+        fakeNow = fakeNow.addingTimeInterval(30)
+        totals = ",bytes_in,bytes_out,\ncurl.42,31000,3100,\n"
+        _ = sampler.snapshot(now: fakeNow, demand: [.warmNetwork])
+        queue.sync {}
+        let snapshot = sampler.snapshot(now: fakeNow.addingTimeInterval(1), demand: [])
+
+        XCTAssertEqual(oneShots, 2)
+        XCTAssertTrue(snapshot.networkProcessesSampled)
+        XCTAssertEqual(snapshot.networkProcesses.first?.name, "curl")
+        XCTAssertEqual(snapshot.networkProcesses.first?.downloadBytesPerSecond, 1_000)
+        XCTAssertEqual(snapshot.networkProcesses.first?.uploadBytesPerSecond, 100)
     }
 
     func testProcessCPUWaitsForAFreshBaselineAfterAGap() {

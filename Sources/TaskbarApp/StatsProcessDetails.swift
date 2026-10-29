@@ -402,10 +402,37 @@ struct StatsNettopBlock: Equatable {
 
     var entries: [Entry]
     var interval: TimeInterval
+    /// nettop's first block: lifetime totals per process rather than a delta.
+    var isTotals = false
+}
+
+/// Parses one-shot `nettop -L 1` output, which is lifetime totals per process.
+func parseStatsNettopTotals(_ output: String) -> [StatsNettopBlock.Entry] {
+    output.components(separatedBy: "\n").compactMap {
+        StatsNettopStreamParser.entry(from: $0.trimmingCharacters(in: CharacterSet(charactersIn: "\r")))
+    }
+}
+
+/// Bytes per second between two sets of lifetime totals. Processes missing from the
+/// earlier set are left out, since their totals could cover hours, not this window.
+func statsNettopRates(
+    from earlier: [StatsNettopBlock.Entry],
+    to later: [StatsNettopBlock.Entry],
+    interval: TimeInterval
+) -> StatsNettopBlock {
+    let before = Dictionary(earlier.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+    let entries = later.compactMap { entry -> StatsNettopBlock.Entry? in
+        // Totals going down means the pid now belongs to a different process.
+        guard let previous = before[entry.pid], entry.bytesIn >= previous.bytesIn, entry.bytesOut >= previous.bytesOut else {
+            return nil
+        }
+        return .init(name: entry.name, pid: entry.pid, bytesIn: entry.bytesIn - previous.bytesIn, bytesOut: entry.bytesOut - previous.bytesOut)
+    }
+    return StatsNettopBlock(entries: entries, interval: max(0.5, interval))
 }
 
 /// Splits nettop's streamed CSV into blocks. Every block starts with a header line; the first
-/// block is lifetime totals rather than a delta, so it's dropped.
+/// block is lifetime totals rather than a delta, so it comes out marked `isTotals`.
 struct StatsNettopStreamParser {
     private var partialLine = ""
     private var current: [StatsNettopBlock.Entry] = []
@@ -443,16 +470,15 @@ struct StatsNettopStreamParser {
     /// one burst, so the stream calls this shortly after the burst instead of waiting two
     /// seconds for the next header.
     mutating func flush() -> StatsNettopBlock? {
-        guard !currentEmitted, headersSeen >= 2,
-              let start = currentStartedAt, let previous = previousStartedAt
-        else {
-            return nil
-        }
+        guard !currentEmitted, headersSeen >= 1, let start = currentStartedAt else { return nil }
         currentEmitted = true
+        guard headersSeen >= 2, let previous = previousStartedAt else {
+            return StatsNettopBlock(entries: current, interval: 0, isTotals: true)
+        }
         return StatsNettopBlock(entries: current, interval: min(10, max(0.5, start.timeIntervalSince(previous))))
     }
 
-    private static func entry(from line: String) -> StatsNettopBlock.Entry? {
+    static func entry(from line: String) -> StatsNettopBlock.Entry? {
         let fields = line.split(separator: ",", omittingEmptySubsequences: false)
         guard fields.count >= 3 else { return nil }
         let identity = String(fields[0])
