@@ -759,9 +759,9 @@ final class TaskbarStatsSamplerTests: XCTestCase {
     func testProcessCPUIsMeasuredOverTheSampleWindowAsAShareOfTheWholeMachine() {
         let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.processes")
         var psOutput = """
-        10 0:10.00 100 /usr/bin/swift-frontend
-        11 0:01.00 100 /usr/bin/swift-frontend
-        12 1:00.00 200 /Applications/Foo.app/Contents/MacOS/Foo
+        10 1 0:10.00 100 /usr/bin/swift-frontend
+        11 1 0:01.00 100 /usr/bin/swift-frontend
+        12 1 1:00.00 200 /Applications/Foo.app/Contents/MacOS/Foo
 
         """
         var ticks: [UInt32] = [0, 0, 0, 0]
@@ -772,7 +772,8 @@ final class TaskbarStatsSamplerTests: XCTestCase {
             memoryReader: { nil },
             networkCounterReader: { nil },
             processorCount: 4,
-            processFootprintReader: { _ in nil }
+            processUsageReader: { _ in nil },
+            processLister: { nil }
         )
 
         _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.processes])
@@ -781,10 +782,10 @@ final class TaskbarStatsSamplerTests: XCTestCase {
 
         // Three seconds on four cores is 12 core-seconds of capacity.
         psOutput = """
-        10 0:16.00 100 /usr/bin/swift-frontend
-        11 0:02.00 100 /usr/bin/swift-frontend
-        12 1:00.30 200 /Applications/Foo.app/Contents/MacOS/Foo
-        13 0:01.50 50 /usr/bin/git
+        10 1 0:16.00 100 /usr/bin/swift-frontend
+        11 1 0:02.00 100 /usr/bin/swift-frontend
+        12 1 1:00.30 200 /Applications/Foo.app/Contents/MacOS/Foo
+        13 1 0:01.50 50 /usr/bin/git
 
         """
         ticks = [60, 20, 20, 0]
@@ -806,9 +807,61 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         XCTAssertEqual(snapshot.unattributedProcessCPUPercent, 80 - 8.8 / 12 * 100, accuracy: 0.01)
     }
 
+    func testProcessRowsUseScriptNamesFoldersAndHistory() {
+        let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.processDetails")
+        var psOutput = """
+        20 1 0:01.00 100 /usr/local/bin/node
+        21 1 0:01.00 100 /usr/local/bin/node
+        22 1 0:01.00 100 /usr/bin/swift-frontend
+        23 1 0:01.00 100 /usr/bin/swift-frontend
+        30 1 0:00.00 100 /usr/local/bin/runner
+
+        """
+        let sampler = TaskbarStatsSampler(
+            commandOutput: { executable, _ in executable == "/bin/ps" ? psOutput : nil },
+            backgroundQueue: queue,
+            cpuTickReader: { nil },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processorCount: 1,
+            processUsageReader: { _ in nil },
+            processLister: { nil },
+            processDetailReader: { pid, _ in
+                switch pid {
+                case 20: return StatsProcessDetails(arguments: ["node", "/r/node_modules/vite/bin/vite.js"], folder: nil, responsiblePID: 30)
+                case 21: return StatsProcessDetails(arguments: ["node", "/r/scripts/deploy.mjs"], folder: nil, responsiblePID: 30)
+                case 22: return StatsProcessDetails(arguments: nil, folder: "/w/one", responsiblePID: 30)
+                case 23: return StatsProcessDetails(arguments: nil, folder: "/w/two", responsiblePID: 30)
+                default: return nil
+                }
+            }
+        )
+
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.processes])
+        queue.sync {}
+        psOutput = psOutput.replacingOccurrences(of: "0:01.00", with: "0:01.10")
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_001), demand: [.processes])
+        queue.sync {}
+        psOutput = psOutput.replacingOccurrences(of: "0:01.10", with: "0:01.30")
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_004), demand: [.processes])
+        queue.sync {}
+        let snapshot = sampler.snapshot(now: Date(timeIntervalSince1970: 1_005))
+
+        let byName = Dictionary(uniqueKeysWithValues: snapshot.processes.map { ($0.name, $0) })
+        XCTAssertNotNil(byName["node · vite"])
+        XCTAssertNotNil(byName["node · deploy"])
+        XCTAssertEqual(byName["node · vite"]?.startedBy, "runner")
+        let swift = byName["swift-frontend"]
+        XCTAssertEqual(swift?.members.map(\.folder), ["/w/one", "/w/two"])
+        XCTAssertEqual(swift?.key, "swift-frontend")
+        XCTAssertEqual(swift?.cpuHistory.count, 2)
+        XCTAssertEqual(swift?.cpuHistory.first ?? 0, 20, accuracy: 0.01)
+        XCTAssertEqual(swift?.cpuHistory.last ?? 0, 0.4 / 3 * 100, accuracy: 0.01)
+    }
+
     func testProcessCPUWaitsForAFreshBaselineAfterAGap() {
         let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.staleProcesses")
-        var psOutput = "10 0:10.00 100 /usr/bin/git\n"
+        var psOutput = "10 1 0:10.00 100 /usr/bin/git\n"
         let sampler = TaskbarStatsSampler(
             commandOutput: { executable, _ in executable == "/bin/ps" ? psOutput : nil },
             backgroundQueue: queue,
@@ -816,12 +869,13 @@ final class TaskbarStatsSamplerTests: XCTestCase {
             memoryReader: { nil },
             networkCounterReader: { nil },
             processorCount: 4,
-            processFootprintReader: { _ in nil }
+            processUsageReader: { _ in nil },
+            processLister: { nil }
         )
 
         _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.processes])
         queue.sync {}
-        psOutput = "10 0:40.00 100 /usr/bin/git\n"
+        psOutput = "10 1 0:40.00 100 /usr/bin/git\n"
         _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_060), demand: [.processes])
         queue.sync {}
 

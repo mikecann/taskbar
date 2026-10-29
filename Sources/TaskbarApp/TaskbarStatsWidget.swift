@@ -11,14 +11,78 @@ struct StatsProcessSample: Equatable {
     var memoryBytes: Double
     /// How many processes were merged into this row (helpers, parallel compiler jobs).
     var count: Int = 1
+    /// Stable identity for the row across samples: the app bundle path or the display name.
+    var key: String = ""
+    var members: [StatsProcessMember] = []
+    /// The app most of the row's CPU belongs to, when that's a different app (agents
+    /// running builds show up as "Threadbear Runner", for instance).
+    var startedBy: String?
+    /// This row's CPU share over the last minute or so, oldest first.
+    var cpuHistory: [Double] = []
+    /// The part of cpuPercent that came from subprocesses which have since finished.
+    var finishedChildCPUPercent: Double = 0
 }
 
 /// One process as `ps` reports it, before CPU time is turned into a rate.
 struct StatsProcessReading: Equatable {
     var pid: Int
+    var parentPID: Int = 0
     var cpuSeconds: Double
     var memoryBytes: Double
     var executablePath: String
+    /// CPU of children this process has already reaped. Only readable for our own processes.
+    var childCPUSeconds: Double?
+}
+
+/// Processes read straight from the kernel, plus the ones it wouldn't tell us about (other
+/// users', mostly root daemons) for `ps` to fill in.
+struct StatsLocalProcessList {
+    var readings: [StatsProcessReading]
+    var unreadablePIDs: [Int]
+}
+
+/// What proc_pid_rusage adds for our own processes.
+struct StatsProcessUsage: Equatable {
+    var footprintBytes: Double
+    var childCPUSeconds: Double
+}
+
+/// CPU seconds each live process used during the window, including children that started
+/// and finished inside it (macOS adds a child's time to its parent when the parent reaps
+/// it). A big share of a busy build is jobs too short to ever show up in `ps` themselves.
+func statsProcessWindowCPUSeconds(
+    current: [StatsProcessReading],
+    previous: [Int: StatsProcessReading]
+) -> [Int: (total: Double, fromChildren: Double)] {
+    let currentPIDs = Set(current.map(\.pid))
+    // A child we already counted while it was alive lands in its parent's child time again
+    // when it exits, so take what we counted off the parent. When a whole chain exits
+    // together (bash → swift test → xctest), every link's time rolls up into the nearest
+    // ancestor that's still alive, so that's where the correction goes.
+    var alreadyCounted: [Int: Double] = [:]
+    for (pid, reading) in previous where !currentPIDs.contains(pid) {
+        var ancestor = reading.parentPID
+        var hops = 0
+        while !currentPIDs.contains(ancestor), let parent = previous[ancestor], hops < 64 {
+            ancestor = parent.parentPID
+            hops += 1
+        }
+        alreadyCounted[ancestor, default: 0] += reading.cpuSeconds + (reading.childCPUSeconds ?? 0)
+    }
+
+    var result: [Int: (total: Double, fromChildren: Double)] = [:]
+    for reading in current {
+        // A pid missing from the baseline started inside the window, so all its time
+        // counts. Time going backwards means the pid was reused by a new process.
+        let before = previous[reading.pid].flatMap { $0.cpuSeconds <= reading.cpuSeconds ? $0 : nil }
+        let own = reading.cpuSeconds - (before?.cpuSeconds ?? 0)
+        var children = 0.0
+        if let childCPU = reading.childCPUSeconds {
+            children = max(0, childCPU - (before?.childCPUSeconds ?? 0) - alreadyCounted[reading.pid, default: 0])
+        }
+        result[reading.pid] = (own + children, children)
+    }
+    return result
 }
 
 struct StatsNetworkProcessSample: Equatable {
@@ -438,19 +502,21 @@ func parseStatsCPUTime(_ value: String) -> Double? {
 
 func parseStatsProcessReadings(_ output: String) -> [StatsProcessReading] {
     output.split(separator: "\n").compactMap { line in
-        let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-        guard parts.count == 4,
+        let parts = line.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
+        guard parts.count == 5,
               let pid = Int(parts[0]),
-              let cpuSeconds = parseStatsCPUTime(String(parts[1])),
-              let rssKilobytes = Double(String(parts[2]))
+              let parentPID = Int(parts[1]),
+              let cpuSeconds = parseStatsCPUTime(String(parts[2])),
+              let rssKilobytes = Double(String(parts[3]))
         else {
             return nil
         }
         return StatsProcessReading(
             pid: pid,
+            parentPID: parentPID,
             cpuSeconds: cpuSeconds,
             memoryBytes: max(0, rssKilobytes * 1024),
-            executablePath: String(parts[3])
+            executablePath: String(parts[4])
         )
     }
 }
@@ -468,16 +534,83 @@ func statsProcessBundlePath(executablePath: String) -> String? {
     return String(executablePath[..<range.lowerBound]) + ".app"
 }
 
-/// Activity Monitor's "Memory" number. Only works for our own user's processes; the
-/// caller falls back to RSS from `ps` for the rest.
-func readStatsProcessFootprint(pid: Int) -> Double? {
+/// Reads our own processes through libproc. `ps -axo` has to visit every process and took
+/// over two seconds under memory pressure; this takes about a tenth of that, leaving `ps`
+/// only the couple of hundred root processes.
+func readStatsLocalProcesses() -> StatsLocalProcessList? {
+    let count = proc_listallpids(nil, 0)
+    guard count > 0 else { return nil }
+    var pids = [pid_t](repeating: 0, count: Int(count) + 64)
+    let listed = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+    guard listed > 0 else { return nil }
+
+    var readings: [StatsProcessReading] = []
+    var unreadable: [Int] = []
+    var pathBuffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    // Parents usually have lower pids. Reading them first means a child that exits mid-read
+    // shows up as finished, which the next sample corrects for, rather than being counted
+    // alive and again in its parent's reaped time.
+    for pid in pids.prefix(Int(listed)).sorted() where pid > 0 {
+        var usage = rusage_info_v4()
+        let usageResult = withUnsafeMutablePointer(to: &usage) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(pid, RUSAGE_INFO_V4, $0)
+            }
+        }
+        guard usageResult == 0 else {
+            unreadable.append(Int(pid))
+            continue
+        }
+
+        var bsd = proc_bsdinfo()
+        let bsdSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let hasBSD = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, bsdSize) == bsdSize
+        let path: String
+        if proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count)) > 0 {
+            path = String(cString: pathBuffer)
+        } else if hasBSD {
+            path = withUnsafeBytes(of: &bsd.pbi_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        } else {
+            continue
+        }
+
+        readings.append(StatsProcessReading(
+            pid: Int(pid),
+            parentPID: hasBSD ? Int(bsd.pbi_ppid) : 0,
+            cpuSeconds: statsMachTicksToSeconds(usage.ri_user_time + usage.ri_system_time),
+            memoryBytes: Double(usage.ri_phys_footprint),
+            executablePath: path,
+            childCPUSeconds: statsMachTicksToSeconds(usage.ri_child_user_time + usage.ri_child_system_time)
+        ))
+    }
+    return StatsLocalProcessList(readings: readings, unreadablePIDs: unreadable)
+}
+
+func statsMachTicksToSeconds(_ ticks: UInt64) -> Double {
+    Double(ticks) * Double(statsMachTimebase.numer) / Double(statsMachTimebase.denom) / 1_000_000_000
+}
+
+private let statsMachTimebase: mach_timebase_info_data_t = {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return info
+}()
+
+/// Activity Monitor's "Memory" number plus reaped-children CPU time. Only works for our
+/// own user's processes; the caller falls back to `ps` for the rest. rusage times are in
+/// mach ticks, not nanoseconds, on Apple silicon.
+func readStatsProcessUsage(pid: Int) -> StatsProcessUsage? {
     var info = rusage_info_v4()
     let result = withUnsafeMutablePointer(to: &info) {
         $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
             proc_pid_rusage(pid_t(pid), RUSAGE_INFO_V4, $0)
         }
     }
-    return result == 0 ? Double(info.ri_phys_footprint) : nil
+    guard result == 0 else { return nil }
+    return StatsProcessUsage(
+        footprintBytes: Double(info.ri_phys_footprint),
+        childCPUSeconds: statsMachTicksToSeconds(info.ri_child_user_time + info.ri_child_system_time)
+    )
 }
 
 private func readStatsSysctlInteger(_ name: String) -> Int? {
@@ -551,9 +684,14 @@ final class TaskbarStatsSampler {
     private var cachedGPU = StatsGPUReading(percent: 0, renderPercent: 0, tilerPercent: 0, model: "GPU", cores: nil)
     private var cachedProcesses: [StatsProcessSample] = []
     private var cachedUnattributedProcessCPU: Double = 0
-    private var processBaseline: (date: Date, cpuSeconds: [Int: Double], ticks: [UInt32]?)?
+    private var processBaseline: (date: Date, readings: [Int: StatsProcessReading], ticks: [UInt32]?)?
     private let processorCount: Int
-    private let processFootprintReader: (Int) -> Double?
+    private let processUsageReader: (Int) -> StatsProcessUsage?
+    private let processLister: () -> StatsLocalProcessList?
+    private let processDetailReader: (Int, String) -> StatsProcessDetails?
+    // Only touched by the process capture, which never overlaps itself.
+    private var processDetailCache: [Int: (details: StatsProcessDetails?, readAt: Date)] = [:]
+    private var processCPUHistory: [String: [Double]] = [:]
     private var cachedNetworkProcesses: [StatsNetworkProcessSample] = []
 
     init(
@@ -571,7 +709,9 @@ final class TaskbarStatsSampler {
             _ = mach_port_deallocate(mach_task_self_, port)
         },
         processorCount: Int = ProcessInfo.processInfo.activeProcessorCount,
-        processFootprintReader: @escaping (Int) -> Double? = readStatsProcessFootprint
+        processUsageReader: @escaping (Int) -> StatsProcessUsage? = readStatsProcessUsage,
+        processLister: @escaping () -> StatsLocalProcessList? = readStatsLocalProcesses,
+        processDetailReader: @escaping (Int, String) -> StatsProcessDetails? = readStatsProcessDetails
     ) {
         self.commandOutput = commandOutput
         self.backgroundQueue = backgroundQueue
@@ -583,7 +723,9 @@ final class TaskbarStatsSampler {
         self.hostPort = hostPortProvider()
         self.hostPortReleaser = hostPortReleaser
         self.processorCount = max(1, processorCount)
-        self.processFootprintReader = processFootprintReader
+        self.processUsageReader = processUsageReader
+        self.processLister = processLister
+        self.processDetailReader = processDetailReader
     }
 
     deinit {
@@ -929,15 +1071,34 @@ final class TaskbarStatsSampler {
         backgroundQueue.async { [weak self] in
             guard let self else { return }
             let ticks = self.readCPUTicks()
-            let readings = self.commandOutput("/bin/ps", ["-axo", "pid=,time=,rss=,comm="])
-                .map(parseStatsProcessReadings) ?? []
+            var usage: [Int: StatsProcessUsage] = [:]
+            let readings: [StatsProcessReading]
+            if let local = self.processLister() {
+                // ps is setuid root, so it can still read the processes libproc refused.
+                let pidList = local.unreadablePIDs.map(String.init).joined(separator: ",")
+                let others = local.unreadablePIDs.isEmpty ? [] : (self.commandOutput(
+                    "/bin/ps",
+                    ["-o", "pid=,ppid=,time=,rss=,comm=", "-p", pidList]
+                ).map(parseStatsProcessReadings) ?? [])
+                readings = local.readings + others
+            } else {
+                readings = (self.commandOutput("/bin/ps", ["-axo", "pid=,ppid=,time=,rss=,comm="])
+                    .map(parseStatsProcessReadings) ?? [])
+                    .map { reading -> StatsProcessReading in
+                        guard let processUsage = self.processUsageReader(reading.pid) else { return reading }
+                        usage[reading.pid] = processUsage
+                        var reading = reading
+                        reading.childCPUSeconds = processUsage.childCPUSeconds
+                        return reading
+                    }
+            }
 
             self.lock.lock()
             let baseline = self.processBaseline
             if !readings.isEmpty {
                 self.processBaseline = (
                     now,
-                    Dictionary(readings.map { ($0.pid, $0.cpuSeconds) }, uniquingKeysWith: { first, _ in first }),
+                    Dictionary(readings.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first }),
                     ticks
                 )
             }
@@ -950,10 +1111,12 @@ final class TaskbarStatsSampler {
             if let baseline, elapsed > 0, elapsed <= 10 {
                 processes = Self.groupedProcesses(
                     readings: readings,
-                    previousCPUSeconds: baseline.cpuSeconds,
+                    previous: baseline.readings,
                     capacitySeconds: elapsed * Double(self.processorCount),
-                    footprint: self.processFootprintReader
+                    footprint: { usage[$0]?.footprintBytes },
+                    details: self.cachedProcessDetails(for: readings, now: now)
                 )
+                processes = self.attachingCPUHistory(to: processes)
                 if let ticks, let total = cpuUsage(currentTicks: ticks, previousTicks: baseline.ticks)?.activePercent {
                     unattributed = max(0, total - processes.reduce(0) { $0 + $1.cpuPercent })
                 }
@@ -967,11 +1130,44 @@ final class TaskbarStatsSampler {
         }
     }
 
+    /// Details change rarely, so each pid is re-read at most every 30 seconds.
+    private func cachedProcessDetails(for readings: [StatsProcessReading], now: Date) -> [Int: StatsProcessDetails] {
+        var fresh: [Int: (details: StatsProcessDetails?, readAt: Date)] = [:]
+        var result: [Int: StatsProcessDetails] = [:]
+        for reading in readings {
+            let cached = processDetailCache[reading.pid]
+            let entry: (details: StatsProcessDetails?, readAt: Date)
+            if let cached, now.timeIntervalSince(cached.readAt) < 30, now >= cached.readAt {
+                entry = cached
+            } else {
+                let executableName = URL(fileURLWithPath: reading.executablePath).lastPathComponent
+                entry = (processDetailReader(reading.pid, executableName), now)
+            }
+            fresh[reading.pid] = entry
+            result[reading.pid] = entry.details
+        }
+        processDetailCache = fresh
+        return result
+    }
+
+    private func attachingCPUHistory(to processes: [StatsProcessSample]) -> [StatsProcessSample] {
+        var history: [String: [Double]] = [:]
+        let processes = processes.map { process -> StatsProcessSample in
+            var process = process
+            process.cpuHistory = Array(((processCPUHistory[process.key] ?? []) + [process.cpuPercent]).suffix(20))
+            history[process.key] = process.cpuHistory
+            return process
+        }
+        processCPUHistory = history
+        return processes
+    }
+
     private static func groupedProcesses(
         readings: [StatsProcessReading],
-        previousCPUSeconds: [Int: Double],
+        previous: [Int: StatsProcessReading],
         capacitySeconds: Double,
-        footprint: (Int) -> Double?
+        footprint: (Int) -> Double?,
+        details: [Int: StatsProcessDetails] = [:]
     ) -> [StatsProcessSample] {
         let runningApps = uniquePositiveProcessLookup(
             NSWorkspace.shared.runningApplications.map { (Int($0.processIdentifier), $0) }
@@ -982,34 +1178,58 @@ final class TaskbarStatsSampler {
                 appNamesByBundlePath[path] = appNamesByBundlePath[path] ?? name
             }
         }
+        let executableNames = uniquePositiveProcessLookup(readings.map {
+            ($0.pid, URL(fileURLWithPath: $0.executablePath).lastPathComponent)
+        })
 
+        let windowCPU = statsProcessWindowCPUSeconds(current: readings, previous: previous)
         var groups: [String: StatsProcessSample] = [:]
         var topMemberCPU: [String: Double] = [:]
         for reading in readings {
-            // A pid missing from the baseline started inside the window, so all its time counts.
-            let previous = previousCPUSeconds[reading.pid] ?? 0
-            let delta = reading.cpuSeconds >= previous ? reading.cpuSeconds - previous : reading.cpuSeconds
-            let cpu = clampedPercent(delta / capacitySeconds * 100)
+            let window = windowCPU[reading.pid] ?? (0, 0)
+            let cpu = clampedPercent(window.total / capacitySeconds * 100)
+            let finishedChildCPU = clampedPercent(window.fromChildren / capacitySeconds * 100)
             let memory = footprint(reading.pid) ?? reading.memoryBytes
+            let detail = details[reading.pid]
+            let executableName = URL(fileURLWithPath: reading.executablePath).deletingPathExtension().lastPathComponent
 
             let name: String
             let appPath: String
+            let memberName: String
             if let bundlePath = statsProcessBundlePath(executablePath: reading.executablePath) {
                 appPath = bundlePath
                 name = appNamesByBundlePath[bundlePath]
                     ?? URL(fileURLWithPath: bundlePath).deletingPathExtension().lastPathComponent
+                memberName = executableName
             } else {
                 let app = runningApps[reading.pid]
                 appPath = app?.bundleURL?.path ?? reading.executablePath
-                name = app?.localizedName
-                    ?? URL(fileURLWithPath: reading.executablePath).deletingPathExtension().lastPathComponent
+                let interpreterLabel = detail?.arguments.flatMap {
+                    statsInterpreterLabel(executableName: executableName, arguments: $0)
+                }
+                name = app?.localizedName ?? interpreterLabel ?? executableName
+                memberName = name
             }
+            let startedBy = detail?.responsiblePID.flatMap { pid in
+                runningApps[pid]?.localizedName ?? executableNames[pid]
+            }
+            let member = StatsProcessMember(
+                pid: reading.pid,
+                name: memberName,
+                folder: detail?.folder,
+                startedBy: startedBy,
+                cpuPercent: cpu,
+                memoryBytes: memory,
+                finishedChildCPUPercent: finishedChildCPU
+            )
 
             let key = appPath.hasSuffix(".app") ? appPath : name
             if var group = groups[key] {
                 group.cpuPercent += cpu
+                group.finishedChildCPUPercent += finishedChildCPU
                 group.memoryBytes += memory
                 group.count += 1
+                group.members.append(member)
                 if cpu > topMemberCPU[key] ?? 0 {
                     group.pid = reading.pid
                     topMemberCPU[key] = cpu
@@ -1021,12 +1241,32 @@ final class TaskbarStatsSampler {
                     name: name,
                     appPath: appPath,
                     cpuPercent: cpu,
-                    memoryBytes: memory
+                    memoryBytes: memory,
+                    key: key,
+                    members: [member],
+                    finishedChildCPUPercent: finishedChildCPU
                 )
                 topMemberCPU[key] = cpu
             }
         }
-        return Array(groups.values)
+        return groups.values.map { group in
+            var group = group
+            group.startedBy = dominantStarter(of: group.members, excluding: group.name)
+            return group
+        }
+    }
+
+    /// The starter with the most CPU behind it (or the most processes when all are idle).
+    private static func dominantStarter(of members: [StatsProcessMember], excluding name: String) -> String? {
+        var weights: [String: (cpu: Double, count: Int)] = [:]
+        for member in members {
+            guard let starter = member.startedBy, starter != name else { continue }
+            let current = weights[starter] ?? (0, 0)
+            weights[starter] = (current.cpu + member.cpuPercent, current.count + 1)
+        }
+        return weights.max {
+            ($0.value.cpu, $0.value.count, $1.key) < ($1.value.cpu, $1.value.count, $0.key)
+        }?.key
     }
 
     private static func captureNetworkProcesses(commandOutput: StatsCommandOutput) -> [StatsNetworkProcessSample] {
@@ -1771,11 +2011,157 @@ final class StatsPopoverViewController: NSViewController {
     }
 }
 
-private final class StatsPopoverView: NSView {
+private final class StatsPopoverView: NSView, NSViewToolTipOwner {
     private let metric: StatsWidgetMetric
     private let cpuCoreColors: StatsCPUCoreColors
+    static let kernelRowKey = "__kernel"
+    static let finishedSubrowKey = "__finished"
+
+    // Top Processes interaction. The table is drawn by hand, so these remember what was
+    // drawn where for hover, clicks, tooltips and the context menu.
+    private var expandedProcessKey: String?
+    private var hoverPoint: NSPoint?
+    private var frozenProcessOrder: [String]?
+    private var lastProcessOrder: [String] = []
+    private var processTableRect: NSRect = .zero
+    private var processTableItems: [StatsProcessTableItem] = []
+    private var processRowsByKey: [String: StatsProcessSample] = [:]
+    private var expandedSubrows: [StatsProcessSubrow] = []
+    private var processTrackingArea: NSTrackingArea?
 
     override var isFlipped: Bool { true }
+
+    // The panel never becomes key, so the first click has to count.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let processTrackingArea {
+            removeTrackingArea(processTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        processTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let wasInTable = hoverPoint.map { processTableRect.contains($0) } ?? false
+        let isInTable = processTableRect.contains(point)
+        hoverPoint = point
+        if isInTable && !wasInTable {
+            frozenProcessOrder = lastProcessOrder
+        } else if !isInTable {
+            frozenProcessOrder = nil
+        }
+        if isInTable || wasInTable {
+            needsDisplay = true
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverPoint = nil
+        frozenProcessOrder = nil
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard case let .group(key, _)? = processTableItem(at: point), key != Self.kernelRowKey else {
+            super.mouseDown(with: event)
+            return
+        }
+        expandedProcessKey = expandedProcessKey == key ? nil : key
+        needsDisplay = true
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let item = processTableItem(at: point), let menu = processMenu(for: item) else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    private func processTableItem(at point: NSPoint) -> StatsProcessTableItem? {
+        processTableItems.first { $0.rect.contains(point) }
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        guard let item = processTableItem(at: point) else { return "" }
+        switch item {
+        case let .group(key, _):
+            if key == Self.kernelRowKey {
+                return "CPU used by macOS itself (kernel_task), plus processes that finished between samples, like short build steps."
+            }
+            guard let row = processRowsByKey[key] else { return "" }
+            var lines = [row.name]
+            if let startedBy = row.startedBy { lines.append("Started by \(startedBy)") }
+            lines.append(row.count > 1 ? "\(row.count) processes" : "pid \(row.pid)")
+            lines.append("Click for details, right-click to quit")
+            return lines.joined(separator: "\n")
+        case let .subrow(_, subrowKey, _):
+            if subrowKey == Self.finishedSubrowKey {
+                return "Short jobs these processes started that have already exited, like compiler or git runs."
+            }
+            guard let subrow = expandedSubrows.first(where: { $0.key == subrowKey }) else { return "" }
+            let where_ = subrow.folder.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? subrow.label
+            let pids = subrow.pids.prefix(6).map(String.init).joined(separator: ", ")
+            return "\(where_)\npid \(pids)\(subrow.pids.count > 6 ? ", …" : "")"
+        case .detail, .more:
+            return ""
+        }
+    }
+
+    private func processMenu(for item: StatsProcessTableItem) -> NSMenu? {
+        let pids: [Int]
+        let title: String
+        var revealPath: String?
+        switch item {
+        case let .group(key, _):
+            guard key != Self.kernelRowKey, let row = processRowsByKey[key] else { return nil }
+            pids = row.members.isEmpty ? [row.pid] : row.members.map(\.pid)
+            title = pids.count > 1 ? "\(pids.count) \(row.name) processes" : row.name
+            if row.appPath.hasSuffix(".app") { revealPath = row.appPath }
+        case let .subrow(_, subrowKey, _):
+            guard let subrow = expandedSubrows.first(where: { $0.key == subrowKey }) else { return nil }
+            pids = subrow.pids
+            if subrowKey == Self.finishedSubrowKey {
+                // The jobs are gone; what's left to quit is whatever keeps starting them.
+                title = pids.count > 1 ? "\(pids.count) processes starting jobs" : "the process starting jobs"
+            } else {
+                title = pids.count > 1 ? "\(pids.count) processes in \(subrow.label)" : subrow.label
+            }
+            revealPath = subrow.folder
+        case .detail, .more:
+            return nil
+        }
+
+        let menu = NSMenu()
+        let handler = StatsProcessMenuHandler(pids: pids, title: title, revealPath: revealPath)
+        func add(_ itemTitle: String, _ action: Selector) {
+            let menuItem = NSMenuItem(title: itemTitle, action: action, keyEquivalent: "")
+            menuItem.target = handler
+            // Menu items only hold their target weakly; this keeps the handler alive.
+            menuItem.representedObject = handler
+            menu.addItem(menuItem)
+        }
+        add("Quit \(title)", #selector(StatsProcessMenuHandler.quit))
+        add("Force Quit", #selector(StatsProcessMenuHandler.forceQuit))
+        menu.addItem(.separator())
+        if revealPath != nil {
+            add("Show in Finder", #selector(StatsProcessMenuHandler.reveal))
+        }
+        add(pids.count > 1 ? "Copy PIDs" : "Copy PID", #selector(StatsProcessMenuHandler.copyPIDs))
+        add("Open Activity Monitor", #selector(StatsProcessMenuHandler.openActivityMonitor))
+        return menu
+    }
 
     init(frame frameRect: NSRect, metric: StatsWidgetMetric, cpuCoreColors: StatsCPUCoreColors) {
         self.metric = metric
@@ -1841,7 +2227,16 @@ private final class StatsPopoverView: NSView {
         drawPlainDetailRow(label: "Uptime:", value: formattedUptime(ProcessInfo.processInfo.systemUptime), y: 528, in: bounds)
 
         drawSectionTitle("TOP PROCESSES", y: 584, in: bounds)
-        drawProcessTable(processes: topCPUProcesses(snapshot), value: { formattedStatsSharePercent($0.cpuPercent) }, y: 618, in: bounds)
+        drawProcessTable(
+            processes: topCPUProcesses(snapshot),
+            value: { $0.cpuPercent },
+            // Live time per folder; finished subprocesses get their own line below.
+            memberValue: { $0.cpuPercent - $0.finishedChildCPUPercent },
+            format: formattedStatsSharePercent,
+            showsHistory: true,
+            y: 618,
+            in: bounds
+        )
     }
 
     private func drawMemoryPopup(snapshot: StatsSnapshot, in bounds: NSRect) {
@@ -1885,7 +2280,15 @@ private final class StatsPopoverView: NSView {
         drawDetailRow(label: "Free:", value: formattedStatsMemoryBytes(free), color: .systemGray, y: 552, in: bounds)
 
         drawSectionTitle("TOP PROCESSES", y: 602, in: bounds)
-        drawProcessTable(processes: topMemoryProcesses(snapshot), value: { formattedStatsMemoryBytes($0.memoryBytes) }, y: 636, in: bounds)
+        drawProcessTable(
+            processes: topMemoryProcesses(snapshot),
+            value: { $0.memoryBytes },
+            memberValue: { $0.memoryBytes },
+            format: formattedStatsMemoryBytes,
+            showsHistory: false,
+            y: 636,
+            in: bounds
+        )
     }
 
     private func drawGPUPopup(snapshot: StatsSnapshot, in bounds: NSRect) {
@@ -1962,14 +2365,15 @@ private final class StatsPopoverView: NSView {
                 name: "Kernel and exited",
                 appPath: "",
                 cpuPercent: snapshot.unattributedProcessCPUPercent,
-                memoryBytes: 0
+                memoryBytes: 0,
+                key: Self.kernelRowKey
             ))
         }
-        return Array(rows.sorted { $0.cpuPercent > $1.cpuPercent }.prefix(8))
+        return Array(rows.sorted { $0.cpuPercent > $1.cpuPercent }.prefix(30))
     }
 
     private func topMemoryProcesses(_ snapshot: StatsSnapshot) -> [StatsProcessSample] {
-        Array(snapshot.processes.sorted { $0.memoryBytes > $1.memoryBytes }.prefix(8))
+        Array(snapshot.processes.sorted { $0.memoryBytes > $1.memoryBytes }.prefix(30))
     }
 
     private func drawHeader(title: String, in bounds: NSRect) {
@@ -2309,26 +2713,30 @@ private final class StatsPopoverView: NSView {
     private func drawProcessTable(
         processes: [StatsProcessSample],
         valueTitle: String = "Usage",
-        value: (StatsProcessSample) -> String,
+        value: (StatsProcessSample) -> Double,
+        memberValue: (StatsProcessMember) -> Double,
+        format: (Double) -> String,
+        showsHistory: Bool,
         y: CGFloat,
         in bounds: NSRect
     ) {
-        drawStatsText(
-            "Process",
-            in: NSRect(x: 60, y: y, width: 160, height: 18),
-            size: 12,
-            weight: .semibold,
-            color: NSColor(calibratedWhite: 0.56, alpha: 1)
-        )
+        let dim = NSColor(calibratedWhite: 0.56, alpha: 1)
+        drawStatsText("Process", in: NSRect(x: 60, y: y, width: 160, height: 18), size: 12, weight: .semibold, color: dim)
         drawRightAlignedText(
             valueTitle,
             in: NSRect(x: bounds.width - 116, y: y, width: 92, height: 18),
             size: 12,
             weight: .semibold,
-            color: NSColor(calibratedWhite: 0.56, alpha: 1)
+            color: dim
         )
 
-        if processes.isEmpty {
+        let tableTop = y + 28
+        let tableBottom = bounds.height - 24
+        processTableRect = NSRect(x: 0, y: y, width: bounds.width, height: tableBottom - y)
+
+        guard !processes.isEmpty else {
+            processTableItems = []
+            processRowsByKey = [:]
             drawStatsText(
                 "Sampling processes...",
                 in: NSRect(x: 60, y: y + 32, width: bounds.width - 84, height: 20),
@@ -2339,34 +2747,257 @@ private final class StatsPopoverView: NSView {
             return
         }
 
-        let maxRows = max(0, min(8, Int((bounds.height - y - 56) / 26)))
-        for (index, process) in processes.prefix(maxRows).enumerated() {
-            let rowY = y + 32 + CGFloat(index) * 26
-            drawProcessIcon(path: process.appPath, in: NSRect(x: 24, y: rowY + 3, width: 15, height: 15))
-            drawStatsText(
-                process.name,
-                in: NSRect(x: 52, y: rowY, width: bounds.width - 214, height: 20),
-                size: 14,
-                weight: .semibold,
-                color: NSColor(calibratedWhite: 0.86, alpha: 1)
-            )
-            if process.count > 1 {
+        processRowsByKey = Dictionary(processes.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        let sortedKeys = processes.sorted { value($0) > value($1) }.map(\.key)
+        let order = statsStableOrder(current: sortedKeys, frozen: frozenProcessOrder)
+        if frozenProcessOrder != nil {
+            frozenProcessOrder = order
+        }
+        lastProcessOrder = order
+
+        if let expandedProcessKey, processRowsByKey[expandedProcessKey] == nil {
+            self.expandedProcessKey = nil
+        }
+        let expandedRow = expandedProcessKey.flatMap { processRowsByKey[$0] }
+        expandedSubrows = expandedRow.map { row in
+            var subrows = statsProcessSubrows(row.members, value: memberValue)
+            if showsHistory, row.finishedChildCPUPercent >= 0.1 {
+                subrows.append(StatsProcessSubrow(
+                    key: Self.finishedSubrowKey,
+                    label: "Finished subprocesses",
+                    folder: nil,
+                    pids: row.members.filter { $0.finishedChildCPUPercent > 0 }.map(\.pid),
+                    value: row.finishedChildCPUPercent
+                ))
+                subrows.sort { $0.value > $1.value }
+            }
+            return subrows
+        } ?? []
+        // A single process has nothing to break down unless some of its CPU came from
+        // jobs it started; the detail line already says its pid.
+        let hasBreakdown = (expandedRow?.count ?? 0) > 1
+            || expandedSubrows.contains { $0.key == Self.finishedSubrowKey }
+        let subrowsToShow = hasBreakdown ? expandedSubrows : []
+
+        let items = statsProcessTableLayout(
+            rowKeys: order,
+            expandedKey: expandedProcessKey,
+            subrowKeys: subrowsToShow.map(\.key),
+            top: tableTop,
+            bottom: tableBottom,
+            x: 12,
+            width: bounds.width - 24
+        )
+        if items != processTableItems {
+            processTableItems = items
+            removeAllToolTips()
+            for item in items {
+                addToolTip(item.rect, owner: self, userData: nil)
+            }
+        }
+
+        let hovered = hoverPoint.flatMap { point in items.first { $0.rect.contains(point) } }
+        let valueRectX = bounds.width - 124
+
+        // One soft panel behind the expanded row and everything under it.
+        if let expandedProcessKey {
+            let block = items.filter {
+                switch $0 {
+                case let .group(key, _), let .detail(key, _), let .subrow(key, _, _), let .more(key, _, _):
+                    return key == expandedProcessKey
+                }
+            }
+            if let first = block.first, let last = block.last {
+                NSColor(calibratedWhite: 1, alpha: 0.05).setFill()
+                NSBezierPath(roundedRect: first.rect.union(last.rect).insetBy(dx: 0, dy: -2), xRadius: 8, yRadius: 8).fill()
+            }
+        }
+
+        for item in items {
+            if item == hovered {
+                switch item {
+                case let .group(key, _) where key != Self.kernelRowKey:
+                    NSColor(calibratedWhite: 1, alpha: 0.07).setFill()
+                    NSBezierPath(roundedRect: item.rect, xRadius: 6, yRadius: 6).fill()
+                case .subrow:
+                    NSColor(calibratedWhite: 1, alpha: 0.06).setFill()
+                    NSBezierPath(roundedRect: item.rect.insetBy(dx: 30, dy: 1), xRadius: 5, yRadius: 5).fill()
+                default:
+                    break
+                }
+            }
+
+            switch item {
+            case let .group(key, rect):
+                guard let process = processRowsByKey[key] else { continue }
+                let rowY = rect.minY
+                let isExpanded = key == expandedProcessKey
+                if key != Self.kernelRowKey, isExpanded || item == hovered {
+                    drawDisclosure(expanded: isExpanded, in: NSRect(x: rect.minX + 1, y: rowY + 8, width: 8, height: 9))
+                }
+                if key == Self.kernelRowKey {
+                    drawKernelIcon(in: NSRect(x: 24, y: rowY + 6, width: 15, height: 15))
+                } else {
+                    drawProcessIcon(path: process.appPath, in: NSRect(x: 24, y: rowY + 6, width: 15, height: 15))
+                }
+                drawStatsText(
+                    process.name,
+                    in: NSRect(x: 52, y: rowY + 3, width: bounds.width - 214, height: 20),
+                    size: 14,
+                    weight: .semibold,
+                    color: key == Self.kernelRowKey ? NSColor(calibratedWhite: 0.66, alpha: 1) : NSColor(calibratedWhite: 0.86, alpha: 1)
+                )
+                if process.count > 1 {
+                    drawRightAlignedText(
+                        "×\(process.count)",
+                        in: NSRect(x: bounds.width - 166, y: rowY + 4, width: 40, height: 18),
+                        size: 12,
+                        weight: .medium,
+                        color: dim
+                    )
+                }
                 drawRightAlignedText(
-                    "×\(process.count)",
-                    in: NSRect(x: bounds.width - 166, y: rowY + 1, width: 40, height: 18),
+                    format(value(process)),
+                    in: NSRect(x: valueRectX, y: rowY + 3, width: 100, height: 20),
+                    size: 14,
+                    weight: .semibold,
+                    color: .white
+                )
+
+            case let .detail(key, rect):
+                guard let process = processRowsByKey[key] else { continue }
+                var parts: [String] = []
+                if let startedBy = process.startedBy { parts.append("Started by \(startedBy)") }
+                if process.count == 1 {
+                    parts.append("pid \(process.pid)")
+                    if let folder = process.members.first?.folder.flatMap({ statsFolderLabel($0) }) {
+                        parts.append(folder)
+                    }
+                }
+                let historyWidth: CGFloat = showsHistory && process.cpuHistory.count >= 3 ? 88 : 0
+                drawStatsText(
+                    parts.isEmpty ? "\(process.count) processes" : parts.joined(separator: " · "),
+                    in: NSRect(x: 52, y: rect.minY + 4, width: rect.width - 52 - historyWidth - 12, height: 16),
                     size: 12,
                     weight: .medium,
-                    color: NSColor(calibratedWhite: 0.56, alpha: 1)
+                    color: dim
+                )
+                if historyWidth > 0 {
+                    drawRowSparkline(
+                        process.cpuHistory,
+                        in: NSRect(x: bounds.width - 24 - historyWidth, y: rect.minY + 3, width: historyWidth, height: 16)
+                    )
+                }
+
+            case let .subrow(_, subrowKey, rect):
+                guard let subrow = expandedSubrows.first(where: { $0.key == subrowKey }) else { continue }
+                drawStatsText(
+                    subrow.label,
+                    in: NSRect(x: 52, y: rect.minY + 3, width: bounds.width - 214, height: 18),
+                    size: 13,
+                    weight: .medium,
+                    color: NSColor(calibratedWhite: 0.78, alpha: 1)
+                )
+                if subrow.pids.count > 1 {
+                    drawRightAlignedText(
+                        "×\(subrow.pids.count)",
+                        in: NSRect(x: bounds.width - 166, y: rect.minY + 4, width: 40, height: 16),
+                        size: 11,
+                        weight: .medium,
+                        color: dim
+                    )
+                }
+                drawRightAlignedText(
+                    format(subrow.value),
+                    in: NSRect(x: valueRectX, y: rect.minY + 3, width: 100, height: 18),
+                    size: 13,
+                    weight: .medium,
+                    color: NSColor(calibratedWhite: 0.86, alpha: 1)
+                )
+
+            case let .more(_, hidden, rect):
+                drawStatsText(
+                    "+\(hidden) more",
+                    in: NSRect(x: 52, y: rect.minY + 3, width: 160, height: 18),
+                    size: 12,
+                    weight: .medium,
+                    color: dim
                 )
             }
-            drawRightAlignedText(
-                value(process),
-                in: NSRect(x: bounds.width - 124, y: rowY, width: 100, height: 20),
-                size: 14,
-                weight: .semibold,
-                color: .white
-            )
         }
+    }
+
+    private func drawDisclosure(expanded: Bool, in rect: NSRect) {
+        let path = NSBezierPath()
+        if expanded {
+            path.move(to: NSPoint(x: rect.minX, y: rect.minY + 2))
+            path.line(to: NSPoint(x: rect.midX, y: rect.maxY - 2))
+            path.line(to: NSPoint(x: rect.maxX, y: rect.minY + 2))
+        } else {
+            path.move(to: NSPoint(x: rect.minX + 2, y: rect.minY))
+            path.line(to: NSPoint(x: rect.maxX - 2, y: rect.midY))
+            path.line(to: NSPoint(x: rect.minX + 2, y: rect.maxY))
+        }
+        path.lineWidth = 1.6
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        NSColor(calibratedWhite: 0.6, alpha: 1).setStroke()
+        path.stroke()
+    }
+
+    /// A small chip glyph for the kernel row, which has no app icon of its own.
+    private func drawKernelIcon(in rect: NSRect) {
+        let chip = rect.insetBy(dx: 3, dy: 3)
+        NSColor(calibratedWhite: 0.55, alpha: 1).setStroke()
+        let body = NSBezierPath(roundedRect: chip, xRadius: 2, yRadius: 2)
+        body.lineWidth = 1.2
+        body.stroke()
+        let pins = NSBezierPath()
+        for offset in stride(from: chip.minX + 2, through: chip.maxX - 2, by: 3) {
+            pins.move(to: NSPoint(x: offset, y: rect.minY + 0.5))
+            pins.line(to: NSPoint(x: offset, y: chip.minY))
+            pins.move(to: NSPoint(x: offset, y: chip.maxY))
+            pins.line(to: NSPoint(x: offset, y: rect.maxY - 0.5))
+        }
+        pins.lineWidth = 1
+        pins.stroke()
+    }
+
+    /// The row's CPU over the last minute, scaled to its own peak so a steady 3% and a 3%
+    /// spike look different. The peak is written next to it so the scale isn't a mystery.
+    private func drawRowSparkline(_ values: [Double], in rect: NSRect) {
+        let peak = max(values.max() ?? 0, 0.5)
+        let labelWidth: CGFloat = 34
+        let graph = NSRect(x: rect.minX, y: rect.minY, width: rect.width - labelWidth, height: rect.height)
+        let step = graph.width / CGFloat(max(1, 19))
+        let startX = graph.maxX - CGFloat(values.count - 1) * step
+        let points = values.enumerated().map { index, value in
+            NSPoint(x: startX + CGFloat(index) * step, y: graph.maxY - CGFloat(value / peak) * graph.height)
+        }
+        guard let first = points.first, let last = points.last else { return }
+
+        let fill = NSBezierPath()
+        fill.move(to: NSPoint(x: first.x, y: graph.maxY))
+        points.forEach { fill.line(to: $0) }
+        fill.line(to: NSPoint(x: last.x, y: graph.maxY))
+        fill.close()
+        NSColor.systemBlue.withAlphaComponent(0.25).setFill()
+        fill.fill()
+
+        let line = NSBezierPath()
+        line.move(to: first)
+        points.dropFirst().forEach { line.line(to: $0) }
+        line.lineWidth = 1.2
+        NSColor.systemBlue.setStroke()
+        line.stroke()
+
+        drawRightAlignedText(
+            formattedStatsSharePercent(peak),
+            in: NSRect(x: graph.maxX, y: rect.minY + 1, width: labelWidth, height: 14),
+            size: 10,
+            weight: .medium,
+            color: NSColor(calibratedWhite: 0.56, alpha: 1)
+        )
     }
 
     private func drawNetworkProcessTable(_ processes: [StatsNetworkProcessSample], y: CGFloat, in bounds: NSRect) {
@@ -2590,5 +3221,56 @@ private final class StatsPopoverView: NSView {
             return "\(hours) hours, \(minutes) minutes"
         }
         return "\(minutes) minutes"
+    }
+}
+
+/// Carries out a Top Processes context-menu choice.
+final class StatsProcessMenuHandler: NSObject {
+    let pids: [Int]
+    let title: String
+    let revealPath: String?
+
+    init(pids: [Int], title: String, revealPath: String?) {
+        self.pids = pids
+        self.title = title
+        self.revealPath = revealPath
+    }
+
+    @objc func quit() {
+        // One process quits straight away, like Activity Monitor's toolbar button with a
+        // single selection. A whole group asks first, since it can be dozens of processes.
+        guard pids.count == 1 || confirm(force: false) else { return }
+        if !quitStatsProcesses(pids, force: false) { NSSound.beep() }
+    }
+
+    @objc func forceQuit() {
+        guard confirm(force: true) else { return }
+        if !quitStatsProcesses(pids, force: true) { NSSound.beep() }
+    }
+
+    @objc func reveal() {
+        guard let revealPath else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: revealPath)])
+    }
+
+    @objc func copyPIDs() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(pids.map(String.init).joined(separator: " "), forType: .string)
+    }
+
+    @objc func openActivityMonitor() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
+    }
+
+    private func confirm(force: Bool) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = force ? "Force quit \(title)?" : "Quit \(title)?"
+        alert.informativeText = force
+            ? "Unsaved work in them will be lost."
+            : "Each one gets asked to quit, the same as Quit in Activity Monitor."
+        alert.addButton(withTitle: force ? "Force Quit" : "Quit")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 }
