@@ -6,8 +6,19 @@ struct StatsProcessSample: Equatable {
     var pid: Int
     var name: String
     var appPath: String
+    /// Share of the whole machine (all cores), so the rows add up to the CPU total.
     var cpuPercent: Double
     var memoryBytes: Double
+    /// How many processes were merged into this row (helpers, parallel compiler jobs).
+    var count: Int = 1
+}
+
+/// One process as `ps` reports it, before CPU time is turned into a rate.
+struct StatsProcessReading: Equatable {
+    var pid: Int
+    var cpuSeconds: Double
+    var memoryBytes: Double
+    var executablePath: String
 }
 
 struct StatsNetworkProcessSample: Equatable {
@@ -64,6 +75,9 @@ struct StatsSnapshot: Equatable {
     var networkUploadHistory: [Double]
     var networkDownloadHistory: [Double]
     var processes: [StatsProcessSample]
+    /// CPU the live process list can't account for: kernel_task (which `ps` hides) and
+    /// processes that started and exited between samples, like short compiler jobs.
+    var unattributedProcessCPUPercent: Double = 0
     var networkProcesses: [StatsNetworkProcessSample]
 
     static let empty = StatsSnapshot(
@@ -410,6 +424,62 @@ func formattedCPUPerformanceLevels(_ levels: [CPUPerformanceLevel]) -> String {
     levels.map { "\($0.processorCount) \($0.name)" }.joined(separator: " · ")
 }
 
+/// Parses `ps -o time=` output ("697:03.27", or "1:02:03.50" with hours) into seconds.
+func parseStatsCPUTime(_ value: String) -> Double? {
+    let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+    guard !parts.isEmpty, parts.count <= 3 else { return nil }
+    var seconds = 0.0
+    for part in parts {
+        guard let number = Double(part) else { return nil }
+        seconds = seconds * 60 + number
+    }
+    return seconds
+}
+
+func parseStatsProcessReadings(_ output: String) -> [StatsProcessReading] {
+    output.split(separator: "\n").compactMap { line in
+        let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+        guard parts.count == 4,
+              let pid = Int(parts[0]),
+              let cpuSeconds = parseStatsCPUTime(String(parts[1])),
+              let rssKilobytes = Double(String(parts[2]))
+        else {
+            return nil
+        }
+        return StatsProcessReading(
+            pid: pid,
+            cpuSeconds: cpuSeconds,
+            memoryBytes: max(0, rssKilobytes * 1024),
+            executablePath: String(parts[3])
+        )
+    }
+}
+
+/// The outermost app for executables that are themselves app bundles, so Chrome's,
+/// Slack's and Electron helpers count toward their app. Command-line tools that only
+/// ship inside an app (swift-frontend in Xcode) stay on their own.
+func statsProcessBundlePath(executablePath: String) -> String? {
+    guard executablePath.hasPrefix("/"),
+          executablePath.contains(".app/Contents/MacOS/"),
+          let range = executablePath.range(of: ".app/")
+    else {
+        return nil
+    }
+    return String(executablePath[..<range.lowerBound]) + ".app"
+}
+
+/// Activity Monitor's "Memory" number. Only works for our own user's processes; the
+/// caller falls back to RSS from `ps` for the rest.
+func readStatsProcessFootprint(pid: Int) -> Double? {
+    var info = rusage_info_v4()
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+            proc_pid_rusage(pid_t(pid), RUSAGE_INFO_V4, $0)
+        }
+    }
+    return result == 0 ? Double(info.ri_phys_footprint) : nil
+}
+
 private func readStatsSysctlInteger(_ name: String) -> Int? {
     var value: Int32 = 0
     var size = MemoryLayout<Int32>.size
@@ -480,6 +550,10 @@ final class TaskbarStatsSampler {
     private var previousNetwork: (counters: [String: NetworkInterfaceCounters], date: Date)?
     private var cachedGPU = StatsGPUReading(percent: 0, renderPercent: 0, tilerPercent: 0, model: "GPU", cores: nil)
     private var cachedProcesses: [StatsProcessSample] = []
+    private var cachedUnattributedProcessCPU: Double = 0
+    private var processBaseline: (date: Date, cpuSeconds: [Int: Double], ticks: [UInt32]?)?
+    private let processorCount: Int
+    private let processFootprintReader: (Int) -> Double?
     private var cachedNetworkProcesses: [StatsNetworkProcessSample] = []
 
     init(
@@ -495,7 +569,9 @@ final class TaskbarStatsSampler {
         hostPortProvider: () -> host_t = { mach_host_self() },
         hostPortReleaser: @escaping (host_t) -> Void = { port in
             _ = mach_port_deallocate(mach_task_self_, port)
-        }
+        },
+        processorCount: Int = ProcessInfo.processInfo.activeProcessorCount,
+        processFootprintReader: @escaping (Int) -> Double? = readStatsProcessFootprint
     ) {
         self.commandOutput = commandOutput
         self.backgroundQueue = backgroundQueue
@@ -506,6 +582,8 @@ final class TaskbarStatsSampler {
         self.networkCounterReader = networkCounterReader
         self.hostPort = hostPortProvider()
         self.hostPortReleaser = hostPortReleaser
+        self.processorCount = max(1, processorCount)
+        self.processFootprintReader = processFootprintReader
     }
 
     deinit {
@@ -517,8 +595,11 @@ final class TaskbarStatsSampler {
         let shouldRefreshGPU = demand.contains(.gpu)
             && now.timeIntervalSince(lastGPURefresh) >= 2.0
             && !isRefreshingGPU
+        // Per-process CPU needs two samples, so take the second one sooner when the
+        // popover has just opened and there's nothing to show yet.
+        let processRefreshInterval: TimeInterval = cachedProcesses.isEmpty ? 1.0 : 3.0
         let shouldRefreshProcesses = demand.contains(.processes)
-            && now.timeIntervalSince(lastProcessRefresh) >= 3.0
+            && now.timeIntervalSince(lastProcessRefresh) >= processRefreshInterval
             && !isRefreshingProcesses
         let shouldRefreshNetworkProcesses = demand.contains(.networkProcesses)
             && now.timeIntervalSince(lastNetworkProcessRefresh) >= 15.0
@@ -545,7 +626,8 @@ final class TaskbarStatsSampler {
                 gpu: shouldRefreshGPU,
                 processes: shouldRefreshProcesses,
                 networkProcesses: shouldRefreshNetworkProcesses,
-                gpuFallback: gpuFallback
+                gpuFallback: gpuFallback,
+                now: now
             )
             return snapshot
         }
@@ -606,6 +688,7 @@ final class TaskbarStatsSampler {
             networkUploadHistory: uploadHistory,
             networkDownloadHistory: downloadHistory,
             processes: processes,
+            unattributedProcessCPUPercent: cachedUnattributedProcessCPU,
             networkProcesses: networkProcesses
         )
         lastRefresh = now
@@ -617,7 +700,8 @@ final class TaskbarStatsSampler {
             gpu: shouldRefreshGPU,
             processes: shouldRefreshProcesses,
             networkProcesses: shouldRefreshNetworkProcesses,
-            gpuFallback: gpuFallback
+            gpuFallback: gpuFallback,
+            now: now
         )
 
         return snapshot
@@ -627,28 +711,29 @@ final class TaskbarStatsSampler {
         gpu: Bool,
         processes: Bool,
         networkProcesses: Bool,
-        gpuFallback: StatsGPUReading
+        gpuFallback: StatsGPUReading,
+        now: Date
     ) {
         if gpu {
             refreshGPUInBackground(fallback: gpuFallback)
         }
         if processes {
-            refreshProcessesInBackground()
+            refreshProcessesInBackground(now: now)
         }
         if networkProcesses {
             refreshNetworkProcessesInBackground()
         }
     }
 
-    private func readCPUUsage() -> CPUUsage? {
-        let currentTicks: [UInt32]
+    private func readCPUTicks() -> [UInt32]? {
         if let cpuTickReader {
-            guard let ticks = cpuTickReader() else { return nil }
-            currentTicks = ticks
-        } else {
-            guard let info = readCPULoadInfo() else { return nil }
-            currentTicks = cpuTicks(from: info)
+            return cpuTickReader()
         }
+        return readCPULoadInfo().map(cpuTicks(from:))
+    }
+
+    private func readCPUUsage() -> CPUUsage? {
+        guard let currentTicks = readCPUTicks() else { return nil }
 
         defer { previousCPUTicks = currentTicks }
         return cpuUsage(currentTicks: currentTicks, previousTicks: previousCPUTicks)
@@ -840,52 +925,108 @@ final class TaskbarStatsSampler {
         )
     }
 
-    private func refreshProcessesInBackground() {
+    private func refreshProcessesInBackground(now: Date) {
         backgroundQueue.async { [weak self] in
             guard let self else { return }
-            let processes = Self.captureProcesses(commandOutput: self.commandOutput)
+            let ticks = self.readCPUTicks()
+            let readings = self.commandOutput("/bin/ps", ["-axo", "pid=,time=,rss=,comm="])
+                .map(parseStatsProcessReadings) ?? []
+
+            self.lock.lock()
+            let baseline = self.processBaseline
+            if !readings.isEmpty {
+                self.processBaseline = (
+                    now,
+                    Dictionary(readings.map { ($0.pid, $0.cpuSeconds) }, uniquingKeysWith: { first, _ in first }),
+                    ticks
+                )
+            }
+            self.lock.unlock()
+
+            var processes: [StatsProcessSample] = []
+            var unattributed: Double = 0
+            let elapsed = baseline.map { now.timeIntervalSince($0.date) } ?? 0
+            // Older baselines would average over the gap since the popover was last open.
+            if let baseline, elapsed > 0, elapsed <= 10 {
+                processes = Self.groupedProcesses(
+                    readings: readings,
+                    previousCPUSeconds: baseline.cpuSeconds,
+                    capacitySeconds: elapsed * Double(self.processorCount),
+                    footprint: self.processFootprintReader
+                )
+                if let ticks, let total = cpuUsage(currentTicks: ticks, previousTicks: baseline.ticks)?.activePercent {
+                    unattributed = max(0, total - processes.reduce(0) { $0 + $1.cpuPercent })
+                }
+            }
 
             self.lock.lock()
             self.cachedProcesses = processes
+            self.cachedUnattributedProcessCPU = unattributed
             self.isRefreshingProcesses = false
             self.lock.unlock()
         }
     }
 
-    private static func captureProcesses(commandOutput: StatsCommandOutput) -> [StatsProcessSample] {
-        guard let output = commandOutput("/bin/ps", ["-axo", "pid=,pcpu=,rss=,comm=", "-r"]) else {
-            return []
-        }
-
+    private static func groupedProcesses(
+        readings: [StatsProcessReading],
+        previousCPUSeconds: [Int: Double],
+        capacitySeconds: Double,
+        footprint: (Int) -> Double?
+    ) -> [StatsProcessSample] {
         let runningApps = uniquePositiveProcessLookup(
             NSWorkspace.shared.runningApplications.map { (Int($0.processIdentifier), $0) }
         )
+        var appNamesByBundlePath: [String: String] = [:]
+        for app in NSWorkspace.shared.runningApplications {
+            if let path = app.bundleURL?.path, let name = app.localizedName {
+                appNamesByBundlePath[path] = appNamesByBundlePath[path] ?? name
+            }
+        }
 
-        return output
-            .split(separator: "\n")
-            .compactMap { line -> StatsProcessSample? in
-                let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-                guard parts.count == 4,
-                      let pid = Int(parts[0]),
-                      let cpu = Double(String(parts[1])),
-                      let rssKilobytes = Double(String(parts[2]))
-                else {
-                    return nil
+        var groups: [String: StatsProcessSample] = [:]
+        var topMemberCPU: [String: Double] = [:]
+        for reading in readings {
+            // A pid missing from the baseline started inside the window, so all its time counts.
+            let previous = previousCPUSeconds[reading.pid] ?? 0
+            let delta = reading.cpuSeconds >= previous ? reading.cpuSeconds - previous : reading.cpuSeconds
+            let cpu = clampedPercent(delta / capacitySeconds * 100)
+            let memory = footprint(reading.pid) ?? reading.memoryBytes
+
+            let name: String
+            let appPath: String
+            if let bundlePath = statsProcessBundlePath(executablePath: reading.executablePath) {
+                appPath = bundlePath
+                name = appNamesByBundlePath[bundlePath]
+                    ?? URL(fileURLWithPath: bundlePath).deletingPathExtension().lastPathComponent
+            } else {
+                let app = runningApps[reading.pid]
+                appPath = app?.bundleURL?.path ?? reading.executablePath
+                name = app?.localizedName
+                    ?? URL(fileURLWithPath: reading.executablePath).deletingPathExtension().lastPathComponent
+            }
+
+            let key = appPath.hasSuffix(".app") ? appPath : name
+            if var group = groups[key] {
+                group.cpuPercent += cpu
+                group.memoryBytes += memory
+                group.count += 1
+                if cpu > topMemberCPU[key] ?? 0 {
+                    group.pid = reading.pid
+                    topMemberCPU[key] = cpu
                 }
-
-                let rawPath = String(parts[3])
-                let app = runningApps[pid]
-                let appPath = app?.bundleURL?.path ?? rawPath
-                let name = app?.localizedName
-                    ?? URL(fileURLWithPath: rawPath).deletingPathExtension().lastPathComponent
-                return StatsProcessSample(
-                    pid: pid,
+                groups[key] = group
+            } else {
+                groups[key] = StatsProcessSample(
+                    pid: reading.pid,
                     name: name,
                     appPath: appPath,
-                    cpuPercent: max(0, cpu),
-                    memoryBytes: max(0, rssKilobytes * 1024)
+                    cpuPercent: cpu,
+                    memoryBytes: memory
                 )
+                topMemberCPU[key] = cpu
             }
+        }
+        return Array(groups.values)
     }
 
     private static func captureNetworkProcesses(commandOutput: StatsCommandOutput) -> [StatsNetworkProcessSample] {
@@ -1064,6 +1205,13 @@ func uniquePositiveProcessLookup<Value>(_ values: [(Int, Value)]) -> [Int: Value
 
 func formattedStatsPercent(_ value: Double) -> String {
     "\(Int(round(clampedPercent(value))))%"
+}
+
+/// Per-process shares of an 18-core machine are often a few percent, so keep a decimal there.
+func formattedStatsSharePercent(_ value: Double) -> String {
+    let value = clampedPercent(value)
+    guard value >= 0.05, value < 9.95 else { return formattedStatsPercent(value) }
+    return String(format: "%.1f%%", value)
 }
 
 func formattedStatsBytesPerSecond(_ bytesPerSecond: Double) -> String {
@@ -1693,7 +1841,7 @@ private final class StatsPopoverView: NSView {
         drawPlainDetailRow(label: "Uptime:", value: formattedUptime(ProcessInfo.processInfo.systemUptime), y: 528, in: bounds)
 
         drawSectionTitle("TOP PROCESSES", y: 584, in: bounds)
-        drawProcessTable(processes: topCPUProcesses(snapshot), value: { formattedStatsPercent($0.cpuPercent) }, y: 618, in: bounds)
+        drawProcessTable(processes: topCPUProcesses(snapshot), value: { formattedStatsSharePercent($0.cpuPercent) }, y: 618, in: bounds)
     }
 
     private func drawMemoryPopup(snapshot: StatsSnapshot, in bounds: NSRect) {
@@ -1807,7 +1955,17 @@ private final class StatsPopoverView: NSView {
     }
 
     private func topCPUProcesses(_ snapshot: StatsSnapshot) -> [StatsProcessSample] {
-        Array(snapshot.processes.sorted { $0.cpuPercent > $1.cpuPercent }.prefix(8))
+        var rows = snapshot.processes
+        if !rows.isEmpty, snapshot.unattributedProcessCPUPercent >= 0.5 {
+            rows.append(StatsProcessSample(
+                pid: 0,
+                name: "Kernel and exited",
+                appPath: "",
+                cpuPercent: snapshot.unattributedProcessCPUPercent,
+                memoryBytes: 0
+            ))
+        }
+        return Array(rows.sorted { $0.cpuPercent > $1.cpuPercent }.prefix(8))
     }
 
     private func topMemoryProcesses(_ snapshot: StatsSnapshot) -> [StatsProcessSample] {
@@ -2187,11 +2345,20 @@ private final class StatsPopoverView: NSView {
             drawProcessIcon(path: process.appPath, in: NSRect(x: 24, y: rowY + 3, width: 15, height: 15))
             drawStatsText(
                 process.name,
-                in: NSRect(x: 52, y: rowY, width: bounds.width - 174, height: 20),
+                in: NSRect(x: 52, y: rowY, width: bounds.width - 214, height: 20),
                 size: 14,
                 weight: .semibold,
                 color: NSColor(calibratedWhite: 0.86, alpha: 1)
             )
+            if process.count > 1 {
+                drawRightAlignedText(
+                    "×\(process.count)",
+                    in: NSRect(x: bounds.width - 166, y: rowY + 1, width: 40, height: 18),
+                    size: 12,
+                    weight: .medium,
+                    color: NSColor(calibratedWhite: 0.56, alpha: 1)
+                )
+            }
             drawRightAlignedText(
                 value(process),
                 in: NSRect(x: bounds.width - 124, y: rowY, width: 100, height: 20),

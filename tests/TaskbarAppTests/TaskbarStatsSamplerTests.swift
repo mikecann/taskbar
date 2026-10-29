@@ -756,23 +756,112 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.2)
     }
 
-    func testSnapshotPublishesProcessSamplesAfterBackgroundRefresh() {
+    func testProcessCPUIsMeasuredOverTheSampleWindowAsAShareOfTheWholeMachine() {
         let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.processes")
+        var psOutput = """
+        10 0:10.00 100 /usr/bin/swift-frontend
+        11 0:01.00 100 /usr/bin/swift-frontend
+        12 1:00.00 200 /Applications/Foo.app/Contents/MacOS/Foo
+
+        """
+        var ticks: [UInt32] = [0, 0, 0, 0]
         let sampler = TaskbarStatsSampler(
-            commandOutput: { executable, _ in
-                guard executable == "/bin/ps" else { return nil }
-                return "987654 45.6 789 /Applications/Foo.app/Contents/MacOS/Foo\n"
-            },
-            backgroundQueue: queue
+            commandOutput: { executable, _ in executable == "/bin/ps" ? psOutput : nil },
+            backgroundQueue: queue,
+            cpuTickReader: { ticks },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processorCount: 4,
+            processFootprintReader: { _ in nil }
         )
 
         _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.processes])
         queue.sync {}
-        let snapshot = sampler.snapshot(now: Date(timeIntervalSince1970: 1_001))
+        XCTAssertTrue(sampler.snapshot(now: Date(timeIntervalSince1970: 1_001)).processes.isEmpty)
 
-        XCTAssertEqual(snapshot.processes.first?.pid, 987_654)
-        XCTAssertEqual(snapshot.processes.first?.cpuPercent, 45.6)
-        XCTAssertEqual(snapshot.processes.first?.memoryBytes, 789 * 1024)
+        // Three seconds on four cores is 12 core-seconds of capacity.
+        psOutput = """
+        10 0:16.00 100 /usr/bin/swift-frontend
+        11 0:02.00 100 /usr/bin/swift-frontend
+        12 1:00.30 200 /Applications/Foo.app/Contents/MacOS/Foo
+        13 0:01.50 50 /usr/bin/git
+
+        """
+        ticks = [60, 20, 20, 0]
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_003), demand: [.processes])
+        queue.sync {}
+        let snapshot = sampler.snapshot(now: Date(timeIntervalSince1970: 1_004))
+
+        let byName = Dictionary(uniqueKeysWithValues: snapshot.processes.map { ($0.name, $0) })
+        XCTAssertEqual(byName["swift-frontend"]?.cpuPercent ?? 0, 7.0 / 12 * 100, accuracy: 0.01)
+        XCTAssertEqual(byName["swift-frontend"]?.count, 2)
+        XCTAssertEqual(byName["swift-frontend"]?.pid, 10)
+        XCTAssertEqual(byName["swift-frontend"]?.memoryBytes, 200 * 1024)
+        XCTAssertEqual(byName["Foo"]?.cpuPercent ?? 0, 0.3 / 12 * 100, accuracy: 0.01)
+        XCTAssertEqual(byName["Foo"]?.appPath, "/Applications/Foo.app")
+        // A process that started inside the window counts all of its CPU time.
+        XCTAssertEqual(byName["git"]?.cpuPercent ?? 0, 1.5 / 12 * 100, accuracy: 0.01)
+        // The machine was 80% busy; whatever live processes don't explain is the kernel
+        // plus processes that exited during the window.
+        XCTAssertEqual(snapshot.unattributedProcessCPUPercent, 80 - 8.8 / 12 * 100, accuracy: 0.01)
+    }
+
+    func testProcessCPUWaitsForAFreshBaselineAfterAGap() {
+        let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.staleProcesses")
+        var psOutput = "10 0:10.00 100 /usr/bin/git\n"
+        let sampler = TaskbarStatsSampler(
+            commandOutput: { executable, _ in executable == "/bin/ps" ? psOutput : nil },
+            backgroundQueue: queue,
+            cpuTickReader: { nil },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processorCount: 4,
+            processFootprintReader: { _ in nil }
+        )
+
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.processes])
+        queue.sync {}
+        psOutput = "10 0:40.00 100 /usr/bin/git\n"
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_060), demand: [.processes])
+        queue.sync {}
+
+        // A minute-long gap would average away what's happening now.
+        XCTAssertTrue(sampler.snapshot(now: Date(timeIntervalSince1970: 1_061)).processes.isEmpty)
+    }
+
+    func testStatsCPUTimeParsesPsTimeColumn() {
+        XCTAssertEqual(parseStatsCPUTime("0:04.21") ?? 0, 4.21, accuracy: 0.0001)
+        XCTAssertEqual(parseStatsCPUTime("697:03.27") ?? 0, 41_823.27, accuracy: 0.0001)
+        XCTAssertEqual(parseStatsCPUTime("1:02:03.50") ?? 0, 3_723.5, accuracy: 0.0001)
+        XCTAssertNil(parseStatsCPUTime("abc"))
+        XCTAssertNil(parseStatsCPUTime(""))
+    }
+
+    func testStatsProcessBundlePathGroupsHelpersUnderTheirApp() {
+        XCTAssertEqual(
+            statsProcessBundlePath(
+                executablePath: "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)"
+            ),
+            "/Applications/Google Chrome.app"
+        )
+        XCTAssertEqual(
+            statsProcessBundlePath(executablePath: "/Applications/Foo.app/Contents/MacOS/Foo"),
+            "/Applications/Foo.app"
+        )
+        // Command-line tools that happen to ship inside an app stay separate.
+        XCTAssertNil(
+            statsProcessBundlePath(
+                executablePath: "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend"
+            )
+        )
+        XCTAssertNil(statsProcessBundlePath(executablePath: "/usr/bin/git"))
+        XCTAssertNil(statsProcessBundlePath(executablePath: "node"))
+    }
+
+    func testFormattedStatsSharePercentKeepsADecimalForSmallValues() {
+        XCTAssertEqual(formattedStatsSharePercent(5.24), "5.2%")
+        XCTAssertEqual(formattedStatsSharePercent(0.04), "0%")
+        XCTAssertEqual(formattedStatsSharePercent(11.6), "12%")
     }
 
     func testUniquePositiveProcessLookupIgnoresInvalidAndDuplicatePIDs() {
