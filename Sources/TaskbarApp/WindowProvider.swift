@@ -244,7 +244,8 @@ func collectWindowRecords(screens: [ScreenInfo], includeMinimized: Bool = false)
             appPath: metadata?.appPath ?? "",
             accessibilityTitle: accessibilitySurface?.title ?? "",
             accessibilitySignature: accessibilitySurface?.signature ?? "",
-            isFullscreen: accessibilitySurface?.isFullscreen
+            isFullscreen: accessibilitySurface?.isFullscreen,
+            isBackgroundApp: metadata?.isBackgroundApp ?? false
         )
     }
 
@@ -557,6 +558,7 @@ func applicationWindowMatchScore(
 struct RunningApplicationMetadata {
     let bundleID: String
     let appPath: String
+    var isBackgroundApp = false
 }
 
 final class RunningApplicationMetadataSampler {
@@ -649,7 +651,8 @@ private func collectRunningApplicationMetadata(for pids: Set<pid_t>) -> [pid_t: 
         .reduce(into: [pid_t: RunningApplicationMetadata]()) { result, app in
             result[app.processIdentifier] = RunningApplicationMetadata(
                 bundleID: app.bundleIdentifier ?? "",
-                appPath: app.bundleURL?.path ?? ""
+                appPath: app.bundleURL?.path ?? "",
+                isBackgroundApp: app.activationPolicy != .regular
             )
         }
 }

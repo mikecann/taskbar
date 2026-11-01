@@ -17,7 +17,8 @@ final class TaskbarModelTests: XCTestCase {
         bundleID: String = "",
         appPath: String = "",
         accessibilityTitle: String = "",
-        accessibilitySignature: String = ""
+        accessibilitySignature: String = "",
+        isBackgroundApp: Bool = false
     ) -> WindowRecord {
         WindowRecord(
             owner: owner,
@@ -33,8 +34,25 @@ final class TaskbarModelTests: XCTestCase {
             bundleID: bundleID,
             appPath: appPath,
             accessibilityTitle: accessibilityTitle,
-            accessibilitySignature: accessibilitySignature
+            accessibilitySignature: accessibilitySignature,
+            isBackgroundApp: isBackgroundApp
         )
+    }
+
+    func testVisibleWindowsRejectsUntitledOverlaysFromBackgroundApps() {
+        let records = [
+            // ComputerCub's peeking-bear marker: a borderless, untitled panel at normal level.
+            record(owner: "ComputerCub", title: "ComputerCub", pid: 20, windowID: 1, bounds: CGRect(x: 0, y: 0, width: 64, height: 50), isBackgroundApp: true),
+            record(owner: "ComputerCub", title: "", pid: 20, windowID: 2, isBackgroundApp: true),
+            // A background app's real window has a title, so it still shows.
+            record(owner: "ComputerCub", title: "ComputerCub", pid: 20, windowID: 3, accessibilityTitle: "Set up ComputerCub", isBackgroundApp: true),
+            // An untitled window from a normal app still shows.
+            record(owner: "Safari", title: "Safari", pid: 21, windowID: 4)
+        ]
+
+        let visible = visibleWindows(records, currentPID: 999)
+
+        XCTAssertEqual(visible.map(\.windowID), [3, 4])
     }
 
     func testRunningAppWithAWindowDoesNotGetExtraLauncher() {

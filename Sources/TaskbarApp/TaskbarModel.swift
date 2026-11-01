@@ -33,6 +33,8 @@ struct WindowRecord: Equatable {
     let accessibilitySignature: String
     // nil means Accessibility did not expose a fullscreen state for this window.
     let isFullscreen: Bool?
+    // The owner is a menu bar or agent app (not .regular), so it has no Dock icon.
+    let isBackgroundApp: Bool
 
     init(
         owner: String,
@@ -49,7 +51,8 @@ struct WindowRecord: Equatable {
         appPath: String,
         accessibilityTitle: String,
         accessibilitySignature: String,
-        isFullscreen: Bool? = nil
+        isFullscreen: Bool? = nil,
+        isBackgroundApp: Bool = false
     ) {
         self.owner = owner
         self.title = title
@@ -66,6 +69,7 @@ struct WindowRecord: Equatable {
         self.accessibilityTitle = accessibilityTitle
         self.accessibilitySignature = accessibilitySignature
         self.isFullscreen = isFullscreen
+        self.isBackgroundApp = isBackgroundApp
     }
 }
 
@@ -184,6 +188,7 @@ func visibleWindows(_ records: [WindowRecord], currentPID: pid_t, includeMinimiz
         guard !owner.isEmpty, !ignoredOwners.contains(owner) else { return false }
         guard !(record.pid == currentPID && record.title == "mikerosoft taskbar") else { return false }
         guard record.layer == 0 else { return false }
+        guard !isUntitledBackgroundOverlay(record, owner: owner) else { return false }
         if record.isMinimized {
             return includeMinimized
         }
@@ -192,6 +197,17 @@ func visibleWindows(_ records: [WindowRecord], currentPID: pid_t, includeMinimiz
         guard record.bounds.height >= minimumWindowHeight else { return false }
         return true
     })
+}
+
+// Menu bar apps sometimes draw overlays at normal window level so they stack with the
+// window they decorate (ComputerCub's peeking bear sits just above the window it drives).
+// Those have no title of their own, while a background app's real windows do.
+private func isUntitledBackgroundOverlay(_ record: WindowRecord, owner: String) -> Bool {
+    guard record.isBackgroundApp else { return false }
+    let title = record.title.trimmingCharacters(in: .whitespacesAndNewlines)
+    let titleIsOwnerFallback = title.isEmpty || title.caseInsensitiveCompare(owner) == .orderedSame
+    return titleIsOwnerFallback
+        && record.accessibilityTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 }
 
 private func deduplicatedAccessibilitySurfaces(_ records: [WindowRecord]) -> [WindowRecord] {
