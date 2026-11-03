@@ -19,9 +19,20 @@ final class TaskbarView: NSView {
     private var didDragPinnedItem = false
     private var hoverTrackingArea: NSTrackingArea?
     private(set) var hoveredItemKey: String?
+    private var dragHover = TaskbarDragHover()
     var pointerLocationProvider: (() -> NSPoint?)?
     private var tileHeight: CGFloat {
         max(18, bounds.height - 8)
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes(taskbarDragHoverPasteboardTypes)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes(taskbarDragHoverPasteboardTypes)
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -91,6 +102,58 @@ final class TaskbarView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         updateHover(at: nil)
+    }
+
+    // Drag hover: carrying something (an image, a file, some text) over a tile
+    // and holding it there opens that window, so the drag can carry on into it.
+    // The bar never takes the drop itself.
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        dragHover.reset()
+        return updateDragHover(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        updateDragHover(sender)
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        endDragHover()
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        endDragHover()
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        false
+    }
+
+    // AppKit keeps calling draggingUpdated while the pointer sits still, which
+    // is what lets the dwell timer fire without the mouse moving.
+    override func wantsPeriodicDraggingUpdates() -> Bool {
+        true
+    }
+
+    private func updateDragHover(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let point = convert(sender.draggingLocation, from: nil)
+        updateHover(at: point)
+        let item = taskbarHoverTarget(
+            at: point,
+            tileRects: tileRects.map { (rect: $0.0, item: $0.1) },
+            bounds: bounds
+        )
+        let key = item.map(taskbarItemInteractionKey)
+        if dragHover.update(key: key, at: Date()), let item, taskbarItemOpensOnDragHover(item) {
+            onActivate?(item)
+        }
+        // No drop here, so the source shows the "can't drop" cursor over the bar.
+        return []
+    }
+
+    private func endDragHover() {
+        dragHover.reset()
+        updateHover(at: currentPointerLocation())
     }
 
     private func updateHover(at point: NSPoint?) {
@@ -464,6 +527,61 @@ func taskbarHoverTarget(
         taskbarInteractionRect(for: $0.rect, in: bounds).contains(point)
     }?.item
 }
+
+/// Tracks how long a drag has rested on one tile, and says when to open it.
+struct TaskbarDragHover {
+    var delay: TimeInterval = 0.5
+    private var key: String?
+    private var since: Date?
+    private var fired = false
+
+    init(delay: TimeInterval = 0.5) {
+        self.delay = delay
+    }
+
+    /// Returns true once per visit, when the drag has stayed on `key` for `delay`.
+    mutating func update(key: String?, at now: Date) -> Bool {
+        if key != self.key {
+            self.key = key
+            since = now
+            fired = false
+            return false
+        }
+        guard key != nil, !fired, let since, now.timeIntervalSince(since) >= delay else {
+            return false
+        }
+        fired = true
+        return true
+    }
+
+    mutating func reset() {
+        key = nil
+        since = nil
+        fired = false
+    }
+}
+
+/// A click on the frontmost tile minimizes it, which is the opposite of what
+/// you want while carrying something to drop into it, so that one is skipped.
+func taskbarItemOpensOnDragHover(_ item: TaskbarItem) -> Bool {
+    taskbarItemClickAction(for: item) != .minimize
+}
+
+/// The bar only watches drags, so it registers for every common kind of
+/// dragged content. Types are matched exactly, not by conformance.
+let taskbarDragHoverPasteboardTypes: [NSPasteboard.PasteboardType] = [
+    .fileURL, .URL, .string, .png, .tiff, .pdf, .rtf, .rtfd, .html, .color, .sound,
+    NSPasteboard.PasteboardType("public.jpeg"),
+    NSPasteboard.PasteboardType("public.heic"),
+    NSPasteboard.PasteboardType("public.image"),
+    NSPasteboard.PasteboardType("public.data"),
+    NSPasteboard.PasteboardType("public.item"),
+    NSPasteboard.PasteboardType("public.url"),
+    NSPasteboard.PasteboardType("com.apple.pasteboard.promised-file-url"),
+    NSPasteboard.PasteboardType("com.apple.NSFilePromiseItemMetaData"),
+    NSPasteboard.PasteboardType("Apple files promise pasteboard type"),
+    NSPasteboard.PasteboardType("NSFilenamesPboardType"),
+] + NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
 
 private func taskbarItemInteractionKey(_ item: TaskbarItem) -> String {
     "\(item.identity)#\(item.windowIDs.first.map(String.init) ?? "pinned")"

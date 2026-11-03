@@ -69,6 +69,8 @@ You can also run `bash restart.sh`, `bash open-settings.sh`, or `bash kill.sh`
 directly from this clone.
 
 Click a window button to bring it forward, or restore it if it is minimised.
+Dragging something (an image, a file, some text) over a button and holding it
+there for half a second opens that window, so you can carry on and drop it in.
 Clicking the already selected window keeps it active. Right-click an app to pin
 it, and right-click the bar to open settings for that monitor. Enable Start at
 login in settings if you want it to launch automatically.
