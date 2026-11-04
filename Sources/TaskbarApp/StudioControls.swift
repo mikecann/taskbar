@@ -118,14 +118,42 @@ final class StudioControlsCoordinator {
             }
         case .prompter:
             enqueueDisplayOperation { [weak self] done in
+                let largeTextBefore = StudioDisplayScalingController.shared.isLargeText()
                 DisplayLinkTeleprompterController.shared.setEnabled(target) { result in
                     if case let .failure(error) = result {
                         log("DisplayLink Elgato Prompter change failed: \(error.localizedDescription)")
                     }
                     self?.settle(.prompter, at: target, succeeded: (try? result.get()) != nil)
-                    done()
+                    guard (try? result.get()) != nil, let largeTextBefore else {
+                        done()
+                        return
+                    }
+                    // macOS remembers a layout per set of connected displays,
+                    // modes included, so the prompter coming or going also
+                    // switches PA27JCV's scaling. Put it back once the display
+                    // change has landed, unless a Large text change is queued.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        self?.restoreLargeText(largeTextBefore, then: done)
+                    }
                 }
             }
+        }
+    }
+
+    private func restoreLargeText(_ wanted: Bool, then done: @escaping () -> Void) {
+        guard pending[.largeText] == nil,
+              let current = StudioDisplayScalingController.shared.isLargeText(),
+              current != wanted
+        else {
+            done()
+            return
+        }
+        log("PA27JCV scaling changed with the prompter; putting it back")
+        StudioDisplayScalingController.shared.setStudioEnabled(wanted) { result in
+            if case let .failure(error) = result {
+                log("PA27JCV scaling restore failed: \(error.localizedDescription)")
+            }
+            done()
         }
     }
 

@@ -6,8 +6,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/mikecann/prompter-kit.git",
       "state" : {
-        "revision" : "903ab35a86c173b1bfbbe53b754b73fc0fcc4b05",
-        "version" : "1.0.0"
+        "revision" : "86fac50aa68f8ab45b1d78660eaffeb37d73f540",
+        "version" : "1.0.1"
       }
     }
   ],

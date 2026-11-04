@@ -206,9 +206,18 @@ final class TaskbarSettingsPersistenceTests: XCTestCase {
     }
 
     func testPreferencesRoundTripThroughInjectedUserDefaultsSuite() {
-        let suiteName = "TaskbarSettingsPersistenceTests.\(UUID().uuidString)"
+        // An absolute path keeps the suite's plist in a temp folder. A plain
+        // suite name leaves an empty plist in ~/Library/Preferences on every
+        // run, because cfprefsd rewrites it even after removePersistentDomain.
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TaskbarSettingsPersistenceTests-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let suiteName = folder.appendingPathComponent("prefs").path
         let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: folder)
+        }
         let settings = TaskbarSettings(defaults: defaults)
 
         settings.updateGeneral { values in
