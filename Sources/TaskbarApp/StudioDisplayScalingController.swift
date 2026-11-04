@@ -18,6 +18,12 @@ func studioDisplayScaleTarget(isStudioEnabled: Bool) -> StudioDisplayModeSize {
     return StudioDisplayModeSize(width: 2560, height: 1440, pixelWidth: 5120, pixelHeight: 2880)
 }
 
+/// Whether PA27JCV is on the studio's "Larger Text" mode. Anything else,
+/// including a scale picked by hand in System Settings, counts as off.
+func studioDisplayIsLargeText(_ mode: StudioDisplayModeSize) -> Bool {
+    mode == studioDisplayScaleTarget(isStudioEnabled: true)
+}
+
 func studioDisplayModeIndex(
     matching target: StudioDisplayModeSize,
     in modes: [StudioDisplayModeSize]
@@ -62,6 +68,12 @@ final class StudioDisplayScalingController {
                 DispatchQueue.main.async { completion(result) }
             }
         }
+    }
+
+    /// nil when PA27JCV isn't connected. Main thread only, as it reads NSScreen.
+    func isLargeText() -> Bool? {
+        guard let displayID = displayID(), let mode = CGDisplayCopyDisplayMode(displayID) else { return nil }
+        return studioDisplayIsLargeText(modeSize(mode))
     }
 
     private func displayID() -> CGDirectDisplayID? {

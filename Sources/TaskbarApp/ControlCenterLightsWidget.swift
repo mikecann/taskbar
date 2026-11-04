@@ -115,30 +115,57 @@ final class ControlCenterLightsController: NSObject, NetServiceBrowserDelegate, 
     }
 
     func toggleAll(completion: @escaping (Bool?) -> Void = { _ in }) {
-        let currentEndpoints = stateQueue.sync { () -> [ControlCenterLightEndpoint] in
-            guard !isBusy else { return [] }
+        applyPower(
+            choosingTarget: { controlCenterLightsToggleTarget(for: Array($0.values)) },
+            onTarget: completion
+        )
+    }
+
+    /// Turns every reachable light on or off, whatever they are now. The hover
+    /// panel uses this so its switch means "on", not "flip".
+    func setAll(_ isOn: Bool, completion: @escaping (Bool) -> Void = { _ in }) {
+        applyPower(
+            choosingTarget: { $0.isEmpty ? nil : isOn },
+            onTarget: { if $0 == nil { completion(false) } },
+            onFinish: { completion(true) }
+        )
+    }
+
+    private func applyPower(
+        choosingTarget: @escaping ([String: Bool]) -> Bool?,
+        onTarget: @escaping (Bool?) -> Void,
+        onFinish: @escaping () -> Void = {}
+    ) {
+        let currentEndpoints = stateQueue.sync { () -> [ControlCenterLightEndpoint]? in
+            // nil means another change is running; leave its busy flag alone.
+            guard !isBusy else { return nil }
+            guard !endpoints.isEmpty else { return [] }
             isBusy = true
             return Array(endpoints.values)
         }
+        guard let currentEndpoints else {
+            log("Control Center Lights change skipped: another change is still running")
+            onTarget(nil)
+            return
+        }
         guard !currentEndpoints.isEmpty else {
-            stateQueue.async { [weak self] in self?.isBusy = false }
-            log("Control Center Lights toggle skipped: no devices discovered")
-            completion(nil)
+            log("Control Center Lights change skipped: no devices discovered")
+            onTarget(nil)
             return
         }
 
         fetchPowerStates(from: currentEndpoints) { [weak self] states in
             guard let self else { return }
-            guard let target = controlCenterLightsToggleTarget(for: Array(states.values)) else {
+            guard let target = choosingTarget(states) else {
                 self.stateQueue.async { self.isBusy = false }
-                log("Control Center Lights toggle failed: no devices reachable")
-                completion(nil)
+                log("Control Center Lights change failed: no devices reachable")
+                onTarget(nil)
                 return
             }
 
             // The caller can apply the same intent to related studio hardware
             // while the independent light requests are in flight.
-            completion(target)
+            onTarget(target)
 
             let reachableEndpoints = currentEndpoints.filter { states[$0.id] != nil }
             self.setPower(target, on: reachableEndpoints) { updatedIDs in
@@ -148,6 +175,7 @@ final class ControlCenterLightsController: NSObject, NetServiceBrowserDelegate, 
                         self.powerStates[id] = target
                     }
                     self.isBusy = false
+                    onFinish()
                 }
                 log("Control Center Lights set \(updatedIDs.count)/\(reachableEndpoints.count) device(s) \(target ? "on" : "off")")
             }

@@ -8,6 +8,8 @@ final class TaskbarView: NSView {
     var onItemMenu: ((TaskbarItem) -> NSMenu?)?
     var onWidgetMenu: ((TaskbarWidgetID) -> NSMenu?)?
     var onWidgetActivate: ((TaskbarWidgetID, StatsWidgetMetric?, NSRect, NSView) -> Void)?
+    /// Fires when the pointer moves onto a widget (or off them all, with nil).
+    var onWidgetHover: ((TaskbarWidgetID?, NSRect, TaskbarView) -> Void)?
     var onMovePinnedItem: ((TaskbarItem, TaskbarItem?) -> Void)?
     var onMeasurePreferredTileWidth: (() -> Void)?
 
@@ -19,6 +21,7 @@ final class TaskbarView: NSView {
     private var didDragPinnedItem = false
     private var hoverTrackingArea: NSTrackingArea?
     private(set) var hoveredItemKey: String?
+    private(set) var hoveredWidgetID: TaskbarWidgetID?
     private var dragHover = TaskbarDragHover()
     var pointerLocationProvider: (() -> NSPoint?)?
     private var tileHeight: CGFloat {
@@ -157,6 +160,7 @@ final class TaskbarView: NSView {
     }
 
     private func updateHover(at point: NSPoint?) {
+        updateWidgetHover(at: point)
         let item = point.flatMap { point in
             taskbarHoverTarget(
                 at: point,
@@ -168,6 +172,19 @@ final class TaskbarView: NSView {
         guard key != hoveredItemKey else { return }
         hoveredItemKey = key
         needsDisplay = true
+    }
+
+    private func updateWidgetHover(at point: NSPoint?) {
+        let widget = point.flatMap { point in
+            widgetRects.first { taskbarInteractionRect(for: $0.0, in: bounds).contains(point) }
+        }
+        guard widget?.1 != hoveredWidgetID else { return }
+        hoveredWidgetID = widget?.1
+        onWidgetHover?(widget?.1, widget?.0 ?? .zero, self)
+    }
+
+    func widgetRect(for id: TaskbarWidgetID) -> NSRect? {
+        widgetRects.first { $0.1 == id }?.0
     }
 
     private func currentPointerLocation() -> NSPoint? {

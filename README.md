@@ -97,7 +97,7 @@ Useful settings:
 - Date & Time widget display
 - Battery widget with the current charge level and charging state
 - Stats widget CPU, RAM, network, and CPU display modes
-- One-button toggle for all reachable Elgato Control Center lights
+- One-button toggle for all reachable Elgato Control Center lights, with a hover panel to switch the lights, display scaling and prompter one at a time
 - Auto-hide and reveal animation
 - Pinned apps
 - Keep windows above bar
@@ -151,6 +151,11 @@ larger text when the lights turn on and the default mode when they turn off.
 Disable **Scale PA27JCV for Studio** in the widget settings if
 that does not suit your setup. The Prompter helper comes from
 [prompter-kit](https://github.com/mikecann/prompter-kit).
+
+Rest the pointer on the lights button and a little panel pops up above it with
+a switch each for the lights, PA27JCV's large text and the prompter, so you can
+flip one without the others. It shows what each one is doing right now, and
+greys out anything that isn't plugged in.
 
 Stats shows CPU, RAM, and network activity in a compact strip. CPU can show a
 percentage, aggregate usage history, or one live utilisation bar per logical

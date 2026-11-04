@@ -12,7 +12,7 @@ func recordItLaunchURL(
         .appendingPathComponent("Record It.app", isDirectory: true)
 }
 
-private func launchRecordItWhenStudioTurnsOn(_ isStudioEnabled: Bool) {
+func launchRecordItWhenStudioTurnsOn(_ isStudioEnabled: Bool) {
     guard let appURL = recordItLaunchURL(isStudioEnabled: isStudioEnabled) else { return }
     guard FileManager.default.fileExists(atPath: appURL.path) else {
         log("Record It launch skipped: app not found at \(appURL.path)")
@@ -39,6 +39,8 @@ final class TaskbarPanel {
     private var currentItems: [TaskbarItem] = []
     private var isShown = true
     private var isObscuredByFullscreenWindow = false
+    /// Keeps an auto-hiding bar up while the lights hover panel sits above it.
+    var isHeldOpen = false
 
     init(
         screen: ScreenInfo,
@@ -107,6 +109,9 @@ final class TaskbarPanel {
                 relativeTo: rect,
                 of: view
             )
+        }
+        view.onWidgetHover = { [weak controller, screenID] widgetID, _, view in
+            controller?.widgetHoverChanged(widgetID, screenID: screenID, view: view)
         }
         view.onMovePinnedItem = { [weak controller, screenID] item, target in
             controller?.movePinnedItem(item, before: target, screenID: screenID, monitorID: capturedMonitorID)
@@ -179,6 +184,7 @@ final class TaskbarPanel {
     }
 
     private func shouldReveal(mouseLocation: NSPoint) -> Bool {
+        if isHeldOpen { return true }
         guard screen.appKitFrame.contains(mouseLocation) else { return false }
         let revealHeight = isShown ? CGFloat(values.taskbarHeight) + 8 : 6
         return mouseLocation.y <= screen.appKitFrame.minY + revealHeight
@@ -269,6 +275,13 @@ final class TaskbarController: NSObject {
     private var statsPopoverPanel: NSPanel?
     private var statsPopoverMetric: StatsWidgetMetric?
     private var statsPopoverEventMonitors: [Any] = []
+    private var studioControlsPanel: NSPanel?
+    private weak var studioControlsAnchorView: TaskbarView?
+    private var studioControlsScreenID: UInt32?
+    private var studioControlsOpenWorkItem: DispatchWorkItem?
+    private var studioControlsTimer: Timer?
+    private var studioControlsPointerLeftAt: Date?
+    private var studioControlsLightsRefreshedAt = Date.distantPast
     private var menuItemContext: (screenID: UInt32, monitorID: String, item: TaskbarItem)?
     private var menuWidgetContext: (screenID: UInt32, monitorID: String, widgetID: TaskbarWidgetID)?
     private var menuScreenContext: UInt32?
@@ -360,6 +373,7 @@ final class TaskbarController: NSObject {
         pendingRefreshWorkItem?.cancel()
         timer?.invalidate()
         autoHideTimer?.invalidate()
+        closeStudioControls()
         focusMonitor.stop()
         TaskbarBadgeSampler.shared.onChange = nil
         ChromeProfileStore.shared.onChange = nil
@@ -639,36 +653,11 @@ final class TaskbarController: NSObject {
                 of: view
             )
         case .controlCenterLights:
-            let monitorID = monitorID ?? String(screenID)
-            let controlsTeleprompter = settings.values(for: monitorID)
-                .controlCenterLightsWidget.controlsTeleprompter
-            let controlsStudioDisplayScaling = settings.values(for: monitorID)
-                .controlCenterLightsWidget.controlsStudioDisplayScaling
-            ControlCenterLightsController.shared.toggleAll { target in
-                guard let target else { return }
-                launchRecordItWhenStudioTurnsOn(target)
-                let updateDisplayScaling = {
-                    guard controlsStudioDisplayScaling else { return }
-                    StudioDisplayScalingController.shared.setStudioEnabled(target) { result in
-                        if case let .failure(error) = result {
-                            log("PA27JCV scaling toggle failed: \(error.localizedDescription)")
-                        }
-                    }
-                }
-                if controlsTeleprompter {
-                    DisplayLinkTeleprompterController.shared.setEnabled(target) { result in
-                        if case let .failure(error) = result {
-                            log("DisplayLink Elgato Prompter toggle failed: \(error.localizedDescription)")
-                        }
-                        // A display mode change makes macOS rebuild menu-bar
-                        // state. Finish DisplayLink's AX interaction first so
-                        // PA27JCV scaling cannot invalidate its status item.
-                        updateDisplayScaling()
-                    }
-                } else {
-                    updateDisplayScaling()
-                }
-            }
+            let values = settings.values(for: monitorID ?? String(screenID)).controlCenterLightsWidget
+            StudioControlsCoordinator.shared.toggleStudio(
+                controlsTeleprompter: values.controlsTeleprompter,
+                controlsStudioDisplayScaling: values.controlsStudioDisplayScaling
+            )
         case .battery, .dateTime:
             break
         }
@@ -682,6 +671,7 @@ final class TaskbarController: NSObject {
 
         guard let window = view.window else { return }
         closeStatsPopover()
+        closeStudioControls()
 
         let windowRect = view.convert(rect, to: nil)
         let screenRect = window.convertToScreen(windowRect)
@@ -719,6 +709,127 @@ final class TaskbarController: NSObject {
         statsPopoverPanel = panel
         installStatsPopoverEventMonitors(for: panel)
         panel.orderFrontRegardless()
+    }
+
+    // MARK: Lights hover panel
+
+    func widgetHoverChanged(_ widgetID: TaskbarWidgetID?, screenID: UInt32, view: TaskbarView) {
+        studioControlsOpenWorkItem?.cancel()
+        studioControlsOpenWorkItem = nil
+        guard widgetID == .controlCenterLights, studioControlsPanel == nil else { return }
+
+        // A short dwell, so sweeping the pointer along the bar doesn't pop it open.
+        let work = DispatchWorkItem { [weak self, weak view] in
+            guard let self, let view, view.hoveredWidgetID == .controlCenterLights else { return }
+            self.showStudioControls(anchoredTo: view, screenID: screenID)
+        }
+        studioControlsOpenWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    private func showStudioControls(anchoredTo view: TaskbarView, screenID: UInt32) {
+        guard studioControlsPanel == nil,
+              let buttonRect = studioControlsButtonRect(in: view),
+              let screenFrame = view.window?.screen?.frame
+        else { return }
+        closeStatsPopover()
+
+        let size = StudioControlsLayout.size
+        let panel = NSPanel(
+            contentRect: studioControlsPopoverFrame(buttonRect: buttonRect, screenFrame: screenFrame, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        panel.acceptsMouseMovedEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .transient]
+
+        let content = StudioControlsPopoverView(frame: NSRect(origin: .zero, size: size))
+        content.stateProvider = { StudioControlsCoordinator.shared.state(of: $0) }
+        content.onToggle = { StudioControlsCoordinator.shared.toggle($0) }
+        panel.contentView = content
+
+        studioControlsPanel = panel
+        studioControlsAnchorView = view
+        studioControlsScreenID = screenID
+        studioControlsPointerLeftAt = nil
+        panels[screenID]?.isHeldOpen = true
+        refreshStudioLightsIfStale(force: true)
+        panel.orderFrontRegardless()
+
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.tickStudioControls()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        studioControlsTimer = timer
+    }
+
+    private func tickStudioControls() {
+        guard let panel = studioControlsPanel,
+              let view = studioControlsAnchorView,
+              view.window?.isVisible == true,
+              let buttonRect = studioControlsButtonRect(in: view),
+              let screenFrame = view.window?.screen?.frame
+        else {
+            closeStudioControls()
+            return
+        }
+
+        // Changing PA27JCV's scale re-lays out the bar under the panel, so follow the button.
+        let frame = studioControlsPopoverFrame(buttonRect: buttonRect, screenFrame: screenFrame, size: panel.frame.size)
+        if frame != panel.frame {
+            panel.setFrame(frame, display: false)
+        }
+
+        if studioControlsPopoverKeepsOpen(pointer: NSEvent.mouseLocation, buttonRect: buttonRect, popoverFrame: panel.frame) {
+            studioControlsPointerLeftAt = nil
+        } else if let leftAt = studioControlsPointerLeftAt {
+            if Date().timeIntervalSince(leftAt) > 0.3 {
+                closeStudioControls()
+                return
+            }
+        } else {
+            studioControlsPointerLeftAt = Date()
+        }
+
+        refreshStudioLightsIfStale()
+        panel.contentView?.needsDisplay = true
+    }
+
+    /// The lights can be switched from Elgato's own app too, so re-read them while the panel is up.
+    private func refreshStudioLightsIfStale(force: Bool = false) {
+        guard force || Date().timeIntervalSince(studioControlsLightsRefreshedAt) > 2 else { return }
+        studioControlsLightsRefreshedAt = Date()
+        ControlCenterLightsController.shared.refresh()
+    }
+
+    private func studioControlsButtonRect(in view: TaskbarView) -> NSRect? {
+        guard let window = view.window, let rect = view.widgetRect(for: .controlCenterLights) else { return nil }
+        // Use the bar's full height: the widget's own rect is inset, which would
+        // tuck the panel against the bar and leave a dead strip under the pointer.
+        let fullHeight = NSRect(x: rect.minX, y: view.bounds.minY, width: rect.width, height: view.bounds.height)
+        return window.convertToScreen(view.convert(fullHeight, to: nil))
+    }
+
+    private func closeStudioControls() {
+        studioControlsOpenWorkItem?.cancel()
+        studioControlsOpenWorkItem = nil
+        studioControlsTimer?.invalidate()
+        studioControlsTimer = nil
+        studioControlsPanel?.close()
+        studioControlsPanel = nil
+        studioControlsAnchorView = nil
+        if let studioControlsScreenID {
+            panels[studioControlsScreenID]?.isHeldOpen = false
+        }
+        studioControlsScreenID = nil
+        studioControlsPointerLeftAt = nil
     }
 
     private func closeStatsPopover() {
