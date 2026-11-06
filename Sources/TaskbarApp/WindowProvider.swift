@@ -188,8 +188,12 @@ func collectWindowRecords(screens: [ScreenInfo], includeMinimized: Bool = false)
         .optionOnScreenOnly,
         .excludeDesktopElements
     ]
-    guard let rawWindows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+    guard let allWindows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
         return []
+    }
+    // Not BrowserBear's agent Chrome: its pages are in Threadbear (AgentChrome.swift).
+    let rawWindows = allWindows.filter { window in
+        !AgentChromeProcesses.shared.contains(pid_t((window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value ?? 0))
     }
 
     let rawWindowPIDs = Set(rawWindows.map { window in
@@ -858,7 +862,9 @@ private func filteredMinimizedRecords(
 private func collectMinimizedWindowRecords(screens: [ScreenInfo]) -> [WindowRecord] {
     guard AXIsProcessTrusted() else { return [] }
 
-    let runningApps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+    let runningApps = NSWorkspace.shared.runningApplications.filter {
+        $0.activationPolicy == .regular && !AgentChromeProcesses.shared.contains($0.processIdentifier)
+    }
     let fallbackScreenID = screens.first?.id
     var records: [WindowRecord] = []
 
