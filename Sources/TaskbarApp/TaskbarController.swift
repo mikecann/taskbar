@@ -467,7 +467,10 @@ final class TaskbarController: NSObject {
         // another monitor. Hidden/windowless apps still have an entry to reopen.
         let representedPIDs = Set(visibleWindows(records, currentPID: currentProcessID, includeMinimized: true).map(\.pid))
         let runningApps = NSWorkspace.shared.runningApplications.compactMap { app -> TaskbarRunningApp? in
+            // Not BrowserBear's agent Chrome either: with no window it showed
+            // as a blank Chrome button (AgentChrome.swift).
             guard app.activationPolicy == .regular, app.processIdentifier != currentProcessID,
+                  !AgentChromeProcesses.shared.contains(app.processIdentifier),
                   let url = app.bundleURL else { return nil }
             return TaskbarRunningApp(name: app.localizedName ?? url.deletingPathExtension().lastPathComponent,
                                      pid: app.processIdentifier, bundleID: app.bundleIdentifier ?? "", appPath: url.path)
