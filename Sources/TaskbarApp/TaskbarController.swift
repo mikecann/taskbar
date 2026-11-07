@@ -859,6 +859,12 @@ final class TaskbarController: NSObject {
         studioControlsPointerLeftAt = nil
     }
 
+    /// The widget panel showing right now, if any.
+    var openWidgetPopover: (kind: WidgetPopoverKind, content: NSViewController?)? {
+        guard let statsPopoverPanel, statsPopoverPanel.isVisible, let statsPopoverKind else { return nil }
+        return (statsPopoverKind, statsPopoverPanel.contentViewController)
+    }
+
     private func closeStatsPopover() {
         statsPopoverPanel?.close()
         statsPopoverPanel = nil

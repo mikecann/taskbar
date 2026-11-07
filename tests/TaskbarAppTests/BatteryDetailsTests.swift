@@ -336,3 +336,34 @@ final class BatteryPopoverRenderTests: XCTestCase {
         }
     }
 }
+
+/// Puts a real panel on screen, so it only runs where BATTERY_POPOVER_SCREEN_TESTS is set
+/// (Tinker Desk), never on the Mac someone is using.
+final class BatteryPopoverClickTests: XCTestCase {
+    func testClickingTheBatteryOpensItsPanelAndASecondClickClosesIt() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["BATTERY_POPOVER_SCREEN_TESTS"] != nil)
+        let settings = TaskbarSettings(store: BatteryClickSettingsStore())
+        let controller = TaskbarController(settings: settings, startAtLoginSync: { _ in })
+        let window = NSWindow(contentRect: NSRect(x: 200, y: 0, width: 600, height: 30), styleMask: .borderless, backing: .buffered, defer: false)
+        let view = TaskbarView(frame: NSRect(x: 0, y: 0, width: 600, height: 30))
+        window.contentView = view
+        let rect = NSRect(x: 480, y: 0, width: 60, height: 30)
+
+        controller.activateWidget(.battery, statsMetric: nil, screenID: 1, relativeTo: rect, of: view)
+        let open = try XCTUnwrap(controller.openWidgetPopover)
+        XCTAssertEqual(open.kind, .battery)
+        XCTAssertTrue(open.content is BatteryPopoverViewController)
+
+        controller.activateWidget(.stats, statsMetric: .memory, screenID: 1, relativeTo: rect, of: view)
+        XCTAssertEqual(controller.openWidgetPopover?.kind, .stats(.memory), "another widget swaps the panel")
+
+        controller.activateWidget(.battery, statsMetric: nil, screenID: 1, relativeTo: rect, of: view)
+        controller.activateWidget(.battery, statsMetric: nil, screenID: 1, relativeTo: rect, of: view)
+        XCTAssertNil(controller.openWidgetPopover, "clicking the battery again closes it")
+    }
+}
+
+private final class BatteryClickSettingsStore: TaskbarSettingsStoring {
+    func data(forKey key: String) -> Data? { nil }
+    func set(_ data: Data, forKey key: String) {}
+}
