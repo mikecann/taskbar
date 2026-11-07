@@ -273,7 +273,7 @@ final class TaskbarController: NSObject {
     private var screenParametersObservation: NSObjectProtocol?
     private var settingsWindowController: TaskbarSettingsWindow?
     private var statsPopoverPanel: NSPanel?
-    private var statsPopoverMetric: StatsWidgetMetric?
+    private var statsPopoverKind: WidgetPopoverKind?
     private var statsPopoverEventMonitors: [Any] = []
     private var studioControlsPanel: NSPanel?
     private weak var studioControlsAnchorView: TaskbarView?
@@ -329,6 +329,7 @@ final class TaskbarController: NSObject {
         DisplayLinkTeleprompterController.shared.log = { log($0) }
         performanceWatchdog.start()
         ControlCenterLightsController.shared.start()
+        BatteryHistoryRecorder.shared.start()
         startAtLoginSync(settings.preferences.startAtLogin)
         let screens = screenCollector()
         let includeMinimized = screens.contains { settings.values(for: $0.persistentID).showMinimizedWindows }
@@ -378,6 +379,7 @@ final class TaskbarController: NSObject {
         TaskbarBadgeSampler.shared.onChange = nil
         ChromeProfileStore.shared.onChange = nil
         ControlCenterLightsController.shared.stop()
+        BatteryHistoryRecorder.shared.stop()
         stopObservingScreenChanges()
         settings.flushPendingPersistence()
     }
@@ -661,13 +663,40 @@ final class TaskbarController: NSObject {
                 controlsTeleprompter: values.controlsTeleprompter,
                 controlsStudioDisplayScaling: values.controlsStudioDisplayScaling
             )
-        case .battery, .dateTime:
+        case .battery:
+            showWidgetPopover(
+                kind: .battery,
+                preferredSize: BatteryPopoverLayout.size,
+                relativeTo: rect,
+                of: view
+            ) { _ in BatteryPopoverViewController() }
+        case .dateTime:
             break
         }
     }
 
     private func showStatsPopover(metric: StatsWidgetMetric, monitorID: String, relativeTo rect: NSRect, of view: NSView) {
-        if statsPopoverPanel?.isVisible == true, statsPopoverMetric == metric {
+        let cpuCoreColors = settings.values(for: monitorID).statsWidget.cpuCoreColors
+        showWidgetPopover(
+            kind: .stats(metric),
+            preferredSize: StatsPopoverLayout.size(for: metric),
+            relativeTo: rect,
+            of: view
+        ) { size in
+            StatsPopoverViewController(metric: metric, size: size, cpuCoreColors: cpuCoreColors)
+        }
+    }
+
+    /// One floating panel above the taskbar at a time, shared by the stats and battery
+    /// popovers. Clicking the same widget again closes it.
+    private func showWidgetPopover(
+        kind: WidgetPopoverKind,
+        preferredSize: NSSize,
+        relativeTo rect: NSRect,
+        of view: NSView,
+        makeContent: (NSSize) -> NSViewController
+    ) {
+        if statsPopoverPanel?.isVisible == true, statsPopoverKind == kind {
             closeStatsPopover()
             return
         }
@@ -679,7 +708,6 @@ final class TaskbarController: NSObject {
         let windowRect = view.convert(rect, to: nil)
         let screenRect = window.convertToScreen(windowRect)
         let screenFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? screenRect
-        let preferredSize = StatsPopoverLayout.size(for: metric)
         let size = NSSize(
             width: preferredSize.width,
             height: min(preferredSize.height, max(320, screenFrame.height - 16))
@@ -703,12 +731,8 @@ final class TaskbarController: NSObject {
         panel.isReleasedWhenClosed = false
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .transient]
-        panel.contentViewController = StatsPopoverViewController(
-            metric: metric,
-            size: size,
-            cpuCoreColors: settings.values(for: monitorID).statsWidget.cpuCoreColors
-        )
-        statsPopoverMetric = metric
+        panel.contentViewController = makeContent(size)
+        statsPopoverKind = kind
         statsPopoverPanel = panel
         installStatsPopoverEventMonitors(for: panel)
         panel.orderFrontRegardless()
@@ -838,7 +862,7 @@ final class TaskbarController: NSObject {
     private func closeStatsPopover() {
         statsPopoverPanel?.close()
         statsPopoverPanel = nil
-        statsPopoverMetric = nil
+        statsPopoverKind = nil
         removeStatsPopoverEventMonitors()
     }
 

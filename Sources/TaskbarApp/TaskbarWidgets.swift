@@ -7,6 +7,12 @@ enum TaskbarWidgetID: String, Equatable {
     case dateTime
 }
 
+/// Which widget's floating panel is open above the taskbar.
+enum WidgetPopoverKind: Equatable {
+    case stats(StatsWidgetMetric)
+    case battery
+}
+
 protocol TaskbarWidgetPlugin {
     var id: TaskbarWidgetID { get }
     var title: String { get }

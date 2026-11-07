@@ -744,7 +744,7 @@ final class SettingsWindowController: NSWindowController, TaskbarSettingsWindow,
         stack.addArrangedSubview(settingRow(
             icon: "battery.100",
             title: "Battery",
-            description: "Show the Mac's current battery level in the taskbar.",
+            description: "Show the Mac's battery level in the taskbar. Click it for charging, health and power details.",
             control: batteryWidgetControls(
                 value: values.batteryWidget,
                 enabled: true,

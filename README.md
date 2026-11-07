@@ -95,7 +95,7 @@ Useful settings:
 - Independent horizontal spacing between widgets
 - Background opacity
 - Date & Time widget display
-- Battery widget with the current charge level and charging state
+- Battery widget with the current charge level and charging state, and a click-through panel with power flow, graphs, health and what's using energy
 - Stats widget CPU, RAM, network, and CPU display modes
 - One-button toggle for all reachable Elgato Control Center lights, with a hover panel to switch the lights, display scaling and prompter one at a time
 - Auto-hide and reveal animation
@@ -125,6 +125,28 @@ API. Its wide battery outline fills continuously to the exact percentage and
 keeps a charging bolt without replacing the level. It also uses a low-battery
 warning colour. Its right-click menu includes the charging state and remaining
 time when macOS reports one.
+
+Clicking the battery opens a panel with everything the battery reports through
+the IORegistry (what `ioreg -l -c AppleSmartBattery` prints), no subprocess
+needed:
+
+- Charge, time to full or empty, and what's going on in words. On a charger too
+  small for the load it says so ("The 15 W charger can't keep up...") instead
+  of a bare "not charging".
+- Live power flow: watts from the charger, watts the Mac is using, watts into or
+  out of the battery.
+- Charge and power use graphs over 12 hours, 48 hours or 7 days, with plugged-in
+  stretches shaded and hover for the value at any point.
+- Health (maximum capacity as System Settings shows it, cycles, temperature) and
+  details (mAh, Wh, voltage, current, each cell's voltage, charger, today's
+  range, lifetime temperatures, Low Power Mode).
+- The apps using the most energy, from `top`'s Energy Impact with helpers added
+  to their app. This only runs while the panel is open.
+
+History is a reading a minute, kept for a week in
+`~/Library/Application Support/Mikerosoft Taskbar/battery-history.json`. The
+first run fills in the past week from `pmset -g log`, so the graphs aren't empty
+on day one.
 
 Control Center Lights discovers Elgato lights through Bonjour and shows one
 power button. A click reads every reachable light first. If they are all on it
