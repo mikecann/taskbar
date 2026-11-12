@@ -137,6 +137,41 @@ final class StatsProcessDetailsTests: XCTestCase {
         XCTAssertEqual(window[60]?.fromChildren ?? 0, 1.5, accuracy: 0.0001)
     }
 
+    func testWindowCPURemembersAChildThatVanishedBeforeItsParentReapedIt() {
+        // Seen on Tinker Desk: a 30s child drops out of the process list (exited, not yet
+        // reaped), and only a sample later does its parent's child time jump by its whole
+        // lifetime. Without carrying what we'd counted, that read as 9465% for one second.
+        let parent = { (child: Double) in
+            StatsProcessReading(pid: 70, parentPID: 1, cpuSeconds: 1.0, memoryBytes: 0, executablePath: "swift-package", childCPUSeconds: child)
+        }
+        let sampleA: [Int: StatsProcessReading] = [
+            70: parent(0),
+            71: StatsProcessReading(pid: 71, parentPID: 70, cpuSeconds: 30.0, memoryBytes: 0, executablePath: "swift-build", childCPUSeconds: 0)
+        ]
+
+        // A → B: the child is gone from the list, but the parent hasn't reaped it yet.
+        let ab = statsProcessCPUWindow(current: [parent(0)], previous: sampleA, carriedCredit: [:])
+        XCTAssertEqual(ab.windows[70]?.fromChildren ?? -1, 0, accuracy: 0.0001)
+        XCTAssertEqual(ab.credit[70] ?? 0, 30, accuracy: 0.0001)
+
+        // B → C: reaped. The child ran 0.5s more after we last saw it, so only that is new.
+        let sampleB = Dictionary(uniqueKeysWithValues: [parent(0)].map { ($0.pid, $0) })
+        let bc = statsProcessCPUWindow(current: [parent(30.5)], previous: sampleB, carriedCredit: ab.credit)
+        XCTAssertEqual(bc.windows[70]?.fromChildren ?? -1, 0.5, accuracy: 0.0001)
+        XCTAssertNil(bc.credit[70], "used up")
+    }
+
+    func testWindowCPUDropsCreditWhenThePIDIsReused() {
+        let previous: [Int: StatsProcessReading] = [
+            80: StatsProcessReading(pid: 80, parentPID: 1, cpuSeconds: 5.0, memoryBytes: 0, executablePath: "old", childCPUSeconds: 0)
+        ]
+        // A new process took pid 80, so the old one's unreaped children aren't its business.
+        let current = [StatsProcessReading(pid: 80, parentPID: 1, cpuSeconds: 0.2, memoryBytes: 0, executablePath: "new", childCPUSeconds: 3.0)]
+        let window = statsProcessCPUWindow(current: current, previous: previous, carriedCredit: [80: 10])
+        XCTAssertEqual(window.windows[80]?.fromChildren ?? -1, 3.0, accuracy: 0.0001)
+        XCTAssertNil(window.credit[80])
+    }
+
     func testProcArgsParserSkipsTheExecutablePathAndPadding() {
         var buffer: [UInt8] = []
         var argc = Int32(2)

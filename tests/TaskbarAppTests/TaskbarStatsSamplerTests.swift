@@ -817,6 +817,32 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         XCTAssertEqual(snapshot.unattributedProcessCPUPercent, 320 - 8.8 / 3 * 100, accuracy: 0.01)
     }
 
+    func testOneProcessNeverShowsMoreThanEveryCoreBusy() {
+        let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.cap")
+        let psOutput = "40 1 0:01.00 100 /usr/bin/swift-package\n"
+        var childSeconds = 0.0
+        let sampler = TaskbarStatsSampler(
+            commandOutput: { executable, _ in executable == "/bin/ps" ? psOutput : nil },
+            backgroundQueue: queue,
+            cpuTickReader: { [0, 0, 0, 0] },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processorCount: 4,
+            processUsageReader: { _ in StatsProcessUsage(footprintBytes: 0, childCPUSeconds: childSeconds) },
+            processLister: { nil }
+        )
+
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.processes])
+        queue.sync {}
+        // A child we never saw is reaped: 100s of its lifetime lands in a 3s window.
+        childSeconds = 100
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_003), demand: [.processes])
+        queue.sync {}
+        let row = sampler.snapshot(now: Date(timeIntervalSince1970: 1_004)).processes.first
+
+        XCTAssertEqual(row?.cpuPercent ?? 0, 400, accuracy: 0.01)
+    }
+
     func testProcessRowsUseScriptNamesFoldersAndHistory() {
         let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.processDetails")
         var psOutput = """

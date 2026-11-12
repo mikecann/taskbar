@@ -67,12 +67,23 @@ func statsProcessWindowCPUSeconds(
     current: [StatsProcessReading],
     previous: [Int: StatsProcessReading]
 ) -> [Int: (total: Double, fromChildren: Double)] {
+    statsProcessCPUWindow(current: current, previous: previous, carriedCredit: [:]).windows
+}
+
+/// The window's CPU per process, plus the credit to carry into the next window: time we
+/// already counted for children that have left the list but that their parent (or nearest
+/// living ancestor) hasn't reaped yet.
+func statsProcessCPUWindow(
+    current: [StatsProcessReading],
+    previous: [Int: StatsProcessReading],
+    carriedCredit: [Int: Double]
+) -> (windows: [Int: (total: Double, fromChildren: Double)], credit: [Int: Double]) {
     let currentPIDs = Set(current.map(\.pid))
     // A child we already counted while it was alive lands in its parent's child time again
-    // when it exits, so take what we counted off the parent. When a whole chain exits
+    // when it's reaped, so take what we counted off the parent. When a whole chain exits
     // together (bash → swift test → xctest), every link's time rolls up into the nearest
     // ancestor that's still alive, so that's where the correction goes.
-    var alreadyCounted: [Int: Double] = [:]
+    var credit = carriedCredit
     for (pid, reading) in previous where !currentPIDs.contains(pid) {
         var ancestor = reading.parentPID
         var hops = 0
@@ -80,22 +91,34 @@ func statsProcessWindowCPUSeconds(
             ancestor = parent.parentPID
             hops += 1
         }
-        alreadyCounted[ancestor, default: 0] += reading.cpuSeconds + (reading.childCPUSeconds ?? 0)
+        credit[ancestor, default: 0] += reading.cpuSeconds + (reading.childCPUSeconds ?? 0)
     }
 
     var result: [Int: (total: Double, fromChildren: Double)] = [:]
+    var leftover: [Int: Double] = [:]
     for reading in current {
         // A pid missing from the baseline started inside the window, so all its time
         // counts. Time going backwards means the pid was reused by a new process.
         let before = previous[reading.pid].flatMap { $0.cpuSeconds <= reading.cpuSeconds ? $0 : nil }
         let own = reading.cpuSeconds - (before?.cpuSeconds ?? 0)
+        // Credit belongs to the process that was here before; a new one under the same pid
+        // never had those children.
+        let available = before == nil ? 0 : credit[reading.pid, default: 0]
         var children = 0.0
+        var used = 0.0
         if let childCPU = reading.childCPUSeconds {
-            children = max(0, childCPU - (before?.childCPUSeconds ?? 0) - alreadyCounted[reading.pid, default: 0])
+            let grown = max(0, childCPU - (before?.childCPUSeconds ?? 0))
+            used = min(available, grown)
+            children = grown - used
+        }
+        // A child can drop out of the list (exited, not yet reaped) a sample or more before
+        // its time reaches the parent, so whatever wasn't used up waits for it.
+        if available - used > 0.0001 {
+            leftover[reading.pid] = available - used
         }
         result[reading.pid] = (own + children, children)
     }
-    return result
+    return (result, leftover)
 }
 
 
@@ -710,6 +733,9 @@ final class TaskbarStatsSampler {
     private var cachedProcesses: [StatsProcessSample] = []
     private var cachedUnattributedProcessCPU: Double = 0
     private var processBaseline: (date: Date, readings: [Int: StatsProcessReading], ticks: [UInt32]?)?
+    /// CPU time of children that left the process list before their parent reaped them,
+    /// by the parent's pid. Only touched on the background queue, like the baseline readings.
+    private var processChildCredit: [Int: (seconds: Double, since: Date)] = [:]
     private let processorCount: Int
     private let processUsageReader: (Int) -> StatsProcessUsage?
     private let processLister: () -> StatsLocalProcessList?
@@ -1262,13 +1288,27 @@ final class TaskbarStatsSampler {
             let elapsed = baseline.map { now.timeIntervalSince($0.date) } ?? 0
             // Older baselines would average over the gap since the popover was last open.
             if let baseline, elapsed > 0, elapsed <= 15 {
+                // Credit for children that left the list unreaped is only good for a minute;
+                // a parent that never reaps them shouldn't hide its real child time forever.
+                let carried = self.processChildCredit.filter { now.timeIntervalSince($0.value.since) <= 60 }
+                let window = statsProcessCPUWindow(
+                    current: readings,
+                    previous: baseline.readings,
+                    carriedCredit: carried.mapValues(\.seconds)
+                )
+                self.processChildCredit = window.credit.reduce(into: [:]) { result, entry in
+                    result[entry.key] = (entry.value, carried[entry.key]?.since ?? now)
+                }
                 processes = Self.groupedProcesses(
                     readings: readings,
-                    previous: baseline.readings,
+                    windowCPU: window.windows,
                     // Like Activity Monitor and top, 100% is one full core, so the list lines
                     // up with the per-core bars. A share of the whole machine made a pegged
                     // core read as 5.5% on an 18-core Mac.
                     capacitySeconds: elapsed,
+                    // Nothing can be busier than every core at once. A backstop in case
+                    // child time we couldn't account for lands in one window.
+                    maximumPercent: Double(self.processorCount) * 100,
                     footprint: { usage[$0]?.footprintBytes },
                     details: self.cachedProcessDetails(
                         for: readings.map { ($0.pid, $0.executablePath) },
@@ -1281,6 +1321,9 @@ final class TaskbarStatsSampler {
                     // `total` is a share of the whole machine; turn it into core-percent too.
                     unattributed = max(0, total * Double(self.processorCount) - processes.reduce(0) { $0 + $1.cpuPercent })
                 }
+            } else {
+                // Children counted against a baseline this old may have been reaped since.
+                self.processChildCredit = [:]
             }
 
             self.lock.lock()
@@ -1334,20 +1377,20 @@ final class TaskbarStatsSampler {
 
     private static func groupedProcesses(
         readings: [StatsProcessReading],
-        previous: [Int: StatsProcessReading],
+        windowCPU: [Int: (total: Double, fromChildren: Double)],
         capacitySeconds: Double,
+        maximumPercent: Double,
         footprint: (Int) -> Double?,
         details: [Int: StatsProcessDetails] = [:]
     ) -> [StatsProcessSample] {
-        let windowCPU = statsProcessWindowCPUSeconds(current: readings, previous: previous)
         let entries = readings.map { reading -> StatsProcessEntry in
             let window = windowCPU[reading.pid] ?? (0, 0)
             return StatsProcessEntry(
                 pid: reading.pid,
                 executablePath: reading.executablePath,
                 // No upper clamp: a process busy on three cores is 300%.
-                cpuPercent: max(0, window.total / capacitySeconds * 100),
-                finishedChildCPUPercent: max(0, window.fromChildren / capacitySeconds * 100),
+                cpuPercent: min(maximumPercent, max(0, window.total / capacitySeconds * 100)),
+                finishedChildCPUPercent: min(maximumPercent, max(0, window.fromChildren / capacitySeconds * 100)),
                 memoryBytes: footprint(reading.pid) ?? reading.memoryBytes
             )
         }
