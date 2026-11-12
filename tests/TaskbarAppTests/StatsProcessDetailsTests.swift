@@ -137,39 +137,112 @@ final class StatsProcessDetailsTests: XCTestCase {
         XCTAssertEqual(window[60]?.fromChildren ?? 0, 1.5, accuracy: 0.0001)
     }
 
+    // Readings for the vanished-child tests: pid, parent, own CPU, reaped-children CPU.
+    private static func reading(_ pid: Int, parent: Int = 1, cpu: Double, children: Double? = 0, started: Double? = nil) -> StatsProcessReading {
+        StatsProcessReading(pid: pid, parentPID: parent, cpuSeconds: cpu, memoryBytes: 0, executablePath: "p\(pid)", childCPUSeconds: children, startTime: started)
+    }
+
+    private static func byPID(_ readings: [StatsProcessReading]) -> [Int: StatsProcessReading] {
+        Dictionary(uniqueKeysWithValues: readings.map { ($0.pid, $0) })
+    }
+
+    private static let t0 = Date(timeIntervalSince1970: 1_000)
+
     func testWindowCPURemembersAChildThatVanishedBeforeItsParentReapedIt() {
         // Seen on Tinker Desk: a 30s child drops out of the process list (exited, not yet
         // reaped), and only a sample later does its parent's child time jump by its whole
-        // lifetime. Without carrying what we'd counted, that read as 9465% for one second.
-        let parent = { (child: Double) in
-            StatsProcessReading(pid: 70, parentPID: 1, cpuSeconds: 1.0, memoryBytes: 0, executablePath: "swift-package", childCPUSeconds: child)
-        }
-        let sampleA: [Int: StatsProcessReading] = [
-            70: parent(0),
-            71: StatsProcessReading(pid: 71, parentPID: 70, cpuSeconds: 30.0, memoryBytes: 0, executablePath: "swift-build", childCPUSeconds: 0)
-        ]
+        // lifetime. Without remembering what we'd counted, that read as 9465% for a second.
+        let a = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 30)]
+        let b = [Self.reading(70, cpu: 1)]
+        let c = [Self.reading(70, cpu: 1, children: 30.5)]
 
-        // A → B: the child is gone from the list, but the parent hasn't reaped it yet.
-        let ab = statsProcessCPUWindow(current: [parent(0)], previous: sampleA, carriedCredit: [:])
+        let ab = statsProcessCPUWindow(current: b, previous: Self.byPID(a), vanished: [:], now: Self.t0)
         XCTAssertEqual(ab.windows[70]?.fromChildren ?? -1, 0, accuracy: 0.0001)
-        XCTAssertEqual(ab.credit[70] ?? 0, 30, accuracy: 0.0001)
+        XCTAssertEqual(ab.vanished[71]?.credit ?? 0, 30, accuracy: 0.0001)
 
-        // B → C: reaped. The child ran 0.5s more after we last saw it, so only that is new.
-        let sampleB = Dictionary(uniqueKeysWithValues: [parent(0)].map { ($0.pid, $0) })
-        let bc = statsProcessCPUWindow(current: [parent(30.5)], previous: sampleB, carriedCredit: ab.credit)
+        // Reaped: the child ran 0.5s more after we last saw it, so only that is new.
+        let bc = statsProcessCPUWindow(current: c, previous: Self.byPID(b), vanished: ab.vanished, now: Self.t0 + 1)
         XCTAssertEqual(bc.windows[70]?.fromChildren ?? -1, 0.5, accuracy: 0.0001)
-        XCTAssertNil(bc.credit[70], "used up")
+        XCTAssertTrue(bc.vanished.isEmpty, "used up")
     }
 
-    func testWindowCPUDropsCreditWhenThePIDIsReused() {
-        let previous: [Int: StatsProcessReading] = [
-            80: StatsProcessReading(pid: 80, parentPID: 1, cpuSeconds: 5.0, memoryBytes: 0, executablePath: "old", childCPUSeconds: 0)
+    func testWindowCPUPassesCreditUpWhenTheParentExitsToo() {
+        // G → P → C. C vanishes unreaped; then P reaps C and exits, and G reaps P, all
+        // inside one window. C's counted 30s must follow P up to G.
+        let s1 = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 1), Self.reading(72, parent: 71, cpu: 30)]
+        let s2 = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 1)]
+        let s3 = [Self.reading(70, cpu: 1, children: 1 + 30.5)]
+
+        let w12 = statsProcessCPUWindow(current: s2, previous: Self.byPID(s1), vanished: [:], now: Self.t0)
+        let w23 = statsProcessCPUWindow(current: s3, previous: Self.byPID(s2), vanished: w12.vanished, now: Self.t0 + 1)
+
+        XCTAssertEqual(w23.windows[70]?.fromChildren ?? -1, 0.5, accuracy: 0.0001)
+        XCTAssertTrue(w23.vanished.isEmpty)
+    }
+
+    func testWindowCPUPicksUpAChildThatComesBackWhereItLeftOff() {
+        // C goes missing for one sample (unreadable for a moment), then returns.
+        let s1 = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 30)]
+        let s2 = [Self.reading(70, cpu: 1)]
+        let s3 = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 30.1)]
+        let s4 = [Self.reading(70, cpu: 1, children: 30.2)]
+
+        let w12 = statsProcessCPUWindow(current: s2, previous: Self.byPID(s1), vanished: [:], now: Self.t0)
+        let w23 = statsProcessCPUWindow(current: s3, previous: Self.byPID(s2), vanished: w12.vanished, now: Self.t0 + 1)
+        // Not its whole 30.1s lifetime again, and no leftover credit for the old sighting.
+        XCTAssertEqual(w23.windows[71]?.total ?? -1, 0.1, accuracy: 0.0001)
+        XCTAssertTrue(w23.vanished.isEmpty)
+
+        let w34 = statsProcessCPUWindow(current: s4, previous: Self.byPID(s3), vanished: w23.vanished, now: Self.t0 + 2)
+        XCTAssertEqual(w34.windows[70]?.fromChildren ?? -1, 0.1, accuracy: 0.0001)
+        XCTAssertTrue(w34.vanished.isEmpty)
+    }
+
+    func testWindowCPUExpiresEachVanishedChildOnItsOwnClock() {
+        let parent = Self.reading(70, cpu: 1)
+        let carried: [Int: StatsVanishedProcess] = [
+            71: StatsVanishedProcess(reading: Self.reading(71, parent: 70, cpu: 30), ancestor: 70, credit: 30, since: Self.t0),
+            72: StatsVanishedProcess(reading: Self.reading(72, parent: 70, cpu: 20), ancestor: 70, credit: 20, since: Self.t0 + 59)
         ]
-        // A new process took pid 80, so the old one's unreaped children aren't its business.
-        let current = [StatsProcessReading(pid: 80, parentPID: 1, cpuSeconds: 0.2, memoryBytes: 0, executablePath: "new", childCPUSeconds: 3.0)]
-        let window = statsProcessCPUWindow(current: current, previous: previous, carriedCredit: [80: 10])
+        // At t0 + 62 the first has expired but the second is only 3s old.
+        let window = statsProcessCPUWindow(
+            current: [Self.reading(70, cpu: 1, children: 20)],
+            previous: Self.byPID([parent]),
+            vanished: carried,
+            now: Self.t0 + 62
+        )
+        XCTAssertEqual(window.windows[70]?.fromChildren ?? -1, 0, accuracy: 0.0001)
+        XCTAssertTrue(window.vanished.isEmpty)
+    }
+
+    func testWindowCPUDropsCreditWhenTheParentsPIDIsReused() {
+        let carried: [Int: StatsVanishedProcess] = [
+            81: StatsVanishedProcess(reading: Self.reading(81, parent: 80, cpu: 30), ancestor: 80, credit: 30, since: Self.t0)
+        ]
+        // The new pid 80 has more CPU than the old one, so only the start time tells them apart.
+        let window = statsProcessCPUWindow(
+            current: [Self.reading(80, cpu: 0.02, children: 1, started: 200)],
+            previous: Self.byPID([Self.reading(80, cpu: 0.01, started: 100)]),
+            vanished: carried,
+            now: Self.t0 + 1
+        )
+        XCTAssertEqual(window.windows[80]?.total ?? -1, 1.02, accuracy: 0.0001)
+        XCTAssertTrue(window.vanished.isEmpty)
+    }
+
+    func testWindowCPUDropsCreditWhenThePIDIsReusedWithLessTime() {
+        let carried: [Int: StatsVanishedProcess] = [
+            81: StatsVanishedProcess(reading: Self.reading(81, parent: 80, cpu: 10), ancestor: 80, credit: 10, since: Self.t0)
+        ]
+        // Without start times (the `ps` path), time going backwards still means a new process.
+        let window = statsProcessCPUWindow(
+            current: [Self.reading(80, cpu: 0.2, children: 3)],
+            previous: Self.byPID([Self.reading(80, cpu: 5)]),
+            vanished: carried,
+            now: Self.t0 + 1
+        )
         XCTAssertEqual(window.windows[80]?.fromChildren ?? -1, 3.0, accuracy: 0.0001)
-        XCTAssertNil(window.credit[80])
+        XCTAssertTrue(window.vanished.isEmpty)
     }
 
     func testProcArgsParserSkipsTheExecutablePathAndPadding() {

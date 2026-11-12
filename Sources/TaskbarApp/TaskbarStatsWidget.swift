@@ -45,6 +45,9 @@ struct StatsProcessReading: Equatable {
     var executablePath: String
     /// CPU of children this process has already reaped. Only readable for our own processes.
     var childCPUSeconds: Double?
+    /// When the process started (mach ticks), to tell a reused pid from the same process.
+    /// Only readable for our own processes; `ps` readings leave it nil.
+    var startTime: Double? = nil
 }
 
 /// Processes read straight from the kernel, plus the ones it wouldn't tell us about (other
@@ -67,58 +70,115 @@ func statsProcessWindowCPUSeconds(
     current: [StatsProcessReading],
     previous: [Int: StatsProcessReading]
 ) -> [Int: (total: Double, fromChildren: Double)] {
-    statsProcessCPUWindow(current: current, previous: previous, carriedCredit: [:]).windows
+    statsProcessCPUWindow(current: current, previous: previous, vanished: [:], now: Date()).windows
 }
 
-/// The window's CPU per process, plus the credit to carry into the next window: time we
-/// already counted for children that have left the list but that their parent (or nearest
-/// living ancestor) hasn't reaped yet.
+/// A process that left the list after we'd counted some of its CPU. When it's reaped, its
+/// whole lifetime lands in an ancestor's child time, so we keep what we counted until then.
+/// It can drop out (exited but not yet reaped: libproc then has no path or parent for it)
+/// a sample or more before that happens.
+struct StatsVanishedProcess: Equatable {
+    /// How it looked the last time we saw it.
+    var reading: StatsProcessReading
+    /// The nearest ancestor still alive, whose child time its CPU will turn up in.
+    var ancestor: Int
+    /// What we counted that hasn't yet been matched against the ancestor's child time.
+    var credit: Double
+    var since: Date
+}
+
+/// Same process as last time, rather than a new one that got the pid? Start times say for
+/// sure; without them (the `ps` path), CPU time going backwards means a new process.
+func statsIsSameProcess(_ old: StatsProcessReading, _ new: StatsProcessReading) -> Bool {
+    if let oldStart = old.startTime, let newStart = new.startTime {
+        return oldStart == newStart
+    }
+    return old.cpuSeconds <= new.cpuSeconds
+}
+
+/// The window's CPU per process, plus the vanished processes still waiting to be reaped.
+/// Each one's credit is only good for `maximumCreditAge`: an ancestor that never reaps
+/// shouldn't hide its real child time forever.
 func statsProcessCPUWindow(
     current: [StatsProcessReading],
     previous: [Int: StatsProcessReading],
-    carriedCredit: [Int: Double]
-) -> (windows: [Int: (total: Double, fromChildren: Double)], credit: [Int: Double]) {
-    let currentPIDs = Set(current.map(\.pid))
-    // A child we already counted while it was alive lands in its parent's child time again
-    // when it's reaped, so take what we counted off the parent. When a whole chain exits
-    // together (bash → swift test → xctest), every link's time rolls up into the nearest
-    // ancestor that's still alive, so that's where the correction goes.
-    var credit = carriedCredit
-    for (pid, reading) in previous where !currentPIDs.contains(pid) {
-        var ancestor = reading.parentPID
-        var hops = 0
-        while !currentPIDs.contains(ancestor), let parent = previous[ancestor], hops < 64 {
-            ancestor = parent.parentPID
-            hops += 1
+    vanished carried: [Int: StatsVanishedProcess],
+    now: Date,
+    maximumCreditAge: TimeInterval = 60
+) -> (windows: [Int: (total: Double, fromChildren: Double)], vanished: [Int: StatsVanishedProcess]) {
+    let currentByPID = Dictionary(current.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+    var vanished = carried.filter { now.timeIntervalSince($0.value.since) <= maximumCreditAge }
+
+    // Where each live process's window starts: last sample, or for one that was missing for
+    // a while and is back, the last time we saw it. Nil means it's new, so all its time counts.
+    var before: [Int: StatsProcessReading] = [:]
+    for reading in current {
+        if let last = previous[reading.pid] {
+            if statsIsSameProcess(last, reading) { before[reading.pid] = last }
+        } else if let away = vanished.removeValue(forKey: reading.pid), statsIsSameProcess(away.reading, reading) {
+            // Back from a sample or two out of the list: carry on from where we left off,
+            // and its credit goes, since its time never reached a parent.
+            before[reading.pid] = away.reading
         }
-        credit[ancestor, default: 0] += reading.cpuSeconds + (reading.childCPUSeconds ?? 0)
     }
 
-    var result: [Int: (total: Double, fromChildren: Double)] = [:]
-    var leftover: [Int: Double] = [:]
-    for reading in current {
-        // A pid missing from the baseline started inside the window, so all its time
-        // counts. Time going backwards means the pid was reused by a new process.
-        let before = previous[reading.pid].flatMap { $0.cpuSeconds <= reading.cpuSeconds ? $0 : nil }
-        let own = reading.cpuSeconds - (before?.cpuSeconds ?? 0)
-        // Credit belongs to the process that was here before; a new one under the same pid
-        // never had those children.
-        let available = before == nil ? 0 : credit[reading.pid, default: 0]
-        var children = 0.0
-        var used = 0.0
-        if let childCPU = reading.childCPUSeconds {
-            let grown = max(0, childCPU - (before?.childCPUSeconds ?? 0))
-            used = min(available, grown)
-            children = grown - used
+    // Anything that left since the last sample. What we counted for it (its own time and
+    // the children it had reaped) shows up again in an ancestor's child time when it's reaped.
+    for (pid, reading) in previous where currentByPID[pid] == nil {
+        let counted = reading.cpuSeconds + (reading.childCPUSeconds ?? 0)
+        guard counted > 0 else { continue }
+        vanished[pid] = StatsVanishedProcess(reading: reading, ancestor: reading.parentPID, credit: counted, since: now)
+    }
+
+    // When a whole chain exits together (bash → swift test → xctest), every link's time
+    // rolls up into the nearest ancestor that's still alive, so that's where credit goes,
+    // including credit an exiting process was still holding for its own children.
+    let pending = vanished
+    for (pid, entry) in pending {
+        var ancestor = entry.ancestor
+        var hops = 0
+        while currentByPID[ancestor] == nil, hops < 64 {
+            if let parent = previous[ancestor] {
+                ancestor = parent.parentPID
+            } else if let parent = pending[ancestor], parent.ancestor != ancestor {
+                ancestor = parent.ancestor
+            } else {
+                break
+            }
+            hops += 1
         }
-        // A child can drop out of the list (exited, not yet reaped) a sample or more before
-        // its time reaches the parent, so whatever wasn't used up waits for it.
-        if available - used > 0.0001 {
-            leftover[reading.pid] = available - used
+        // Only an ancestor we can follow (same process as last sample, with readable child
+        // time) can ever use the credit.
+        guard before[ancestor] != nil, currentByPID[ancestor]?.childCPUSeconds != nil else {
+            vanished[pid] = nil
+            continue
+        }
+        vanished[pid]?.ancestor = ancestor
+    }
+    let creditByAncestor = Dictionary(grouping: vanished.values, by: \.ancestor)
+
+    var result: [Int: (total: Double, fromChildren: Double)] = [:]
+    for reading in current {
+        let start = before[reading.pid]
+        let own = reading.cpuSeconds - (start?.cpuSeconds ?? 0)
+        var children = 0.0
+        if let childCPU = reading.childCPUSeconds {
+            var grown = max(0, childCPU - (start?.childCPUSeconds ?? 0))
+            // Oldest first, each one only as far as the growth goes.
+            for entry in (creditByAncestor[reading.pid] ?? []).sorted(by: { ($0.since, $0.reading.pid) < ($1.since, $1.reading.pid) }) {
+                guard grown > 0 else { break }
+                let used = min(entry.credit, grown)
+                grown -= used
+                let left = entry.credit - used
+                vanished[entry.reading.pid] = left > 0.0001 ? StatsVanishedProcess(
+                    reading: entry.reading, ancestor: entry.ancestor, credit: left, since: entry.since
+                ) : nil
+            }
+            children = grown
         }
         result[reading.pid] = (own + children, children)
     }
-    return (result, leftover)
+    return (result, vanished)
 }
 
 
@@ -624,7 +684,8 @@ func readStatsLocalProcesses() -> StatsLocalProcessList? {
             cpuSeconds: statsMachTicksToSeconds(usage.ri_user_time + usage.ri_system_time),
             memoryBytes: Double(usage.ri_phys_footprint),
             executablePath: path,
-            childCPUSeconds: statsMachTicksToSeconds(usage.ri_child_user_time + usage.ri_child_system_time)
+            childCPUSeconds: statsMachTicksToSeconds(usage.ri_child_user_time + usage.ri_child_system_time),
+            startTime: Double(usage.ri_proc_start_abstime)
         ))
     }
     return StatsLocalProcessList(readings: readings, unreadablePIDs: unreadable)
@@ -733,9 +794,9 @@ final class TaskbarStatsSampler {
     private var cachedProcesses: [StatsProcessSample] = []
     private var cachedUnattributedProcessCPU: Double = 0
     private var processBaseline: (date: Date, readings: [Int: StatsProcessReading], ticks: [UInt32]?)?
-    /// CPU time of children that left the process list before their parent reaped them,
-    /// by the parent's pid. Only touched on the background queue, like the baseline readings.
-    private var processChildCredit: [Int: (seconds: Double, since: Date)] = [:]
+    /// Processes that left the list before an ancestor reaped them, by pid. Only touched by
+    /// the one process capture allowed to run at a time, on the background queue.
+    private var vanishedProcesses: [Int: StatsVanishedProcess] = [:]
     private let processorCount: Int
     private let processUsageReader: (Int) -> StatsProcessUsage?
     private let processLister: () -> StatsLocalProcessList?
@@ -1288,17 +1349,13 @@ final class TaskbarStatsSampler {
             let elapsed = baseline.map { now.timeIntervalSince($0.date) } ?? 0
             // Older baselines would average over the gap since the popover was last open.
             if let baseline, elapsed > 0, elapsed <= 15 {
-                // Credit for children that left the list unreaped is only good for a minute;
-                // a parent that never reaps them shouldn't hide its real child time forever.
-                let carried = self.processChildCredit.filter { now.timeIntervalSince($0.value.since) <= 60 }
                 let window = statsProcessCPUWindow(
                     current: readings,
                     previous: baseline.readings,
-                    carriedCredit: carried.mapValues(\.seconds)
+                    vanished: self.vanishedProcesses,
+                    now: now
                 )
-                self.processChildCredit = window.credit.reduce(into: [:]) { result, entry in
-                    result[entry.key] = (entry.value, carried[entry.key]?.since ?? now)
-                }
+                self.vanishedProcesses = window.vanished
                 processes = Self.groupedProcesses(
                     readings: readings,
                     windowCPU: window.windows,
@@ -1323,7 +1380,7 @@ final class TaskbarStatsSampler {
                 }
             } else {
                 // Children counted against a baseline this old may have been reaped since.
-                self.processChildCredit = [:]
+                self.vanishedProcesses = [:]
             }
 
             self.lock.lock()
@@ -1397,7 +1454,13 @@ final class TaskbarStatsSampler {
         let executableNames = uniquePositiveProcessLookup(readings.map {
             ($0.pid, statsExecutableDisplayName($0.executablePath))
         })
-        return groupProcessEntries(entries, details: details, executableNames: executableNames)
+        // Same-name processes share a row, and the row can't be busier than the machine either.
+        return groupProcessEntries(entries, details: details, executableNames: executableNames).map { row in
+            var row = row
+            row.cpuPercent = min(maximumPercent, row.cpuPercent)
+            row.finishedChildCPUPercent = min(maximumPercent, row.finishedChildCPUPercent)
+            return row
+        }
     }
 
     /// Merges processes into rows: app helpers under their app, interpreters by script,

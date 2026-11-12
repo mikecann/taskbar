@@ -843,6 +843,32 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         XCTAssertEqual(row?.cpuPercent ?? 0, 400, accuracy: 0.01)
     }
 
+    func testAGroupedRowNeverShowsMoreThanEveryCoreBusy() {
+        let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.groupCap")
+        let psOutput = "40 1 0:01.00 100 /usr/bin/swift-package\n41 1 0:01.00 100 /usr/bin/swift-package\n"
+        var childSeconds = 0.0
+        let sampler = TaskbarStatsSampler(
+            commandOutput: { executable, _ in executable == "/bin/ps" ? psOutput : nil },
+            backgroundQueue: queue,
+            cpuTickReader: { [0, 0, 0, 0] },
+            memoryReader: { nil },
+            networkCounterReader: { nil },
+            processorCount: 4,
+            processUsageReader: { _ in StatsProcessUsage(footprintBytes: 0, childCPUSeconds: childSeconds) },
+            processLister: { nil }
+        )
+
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_000), demand: [.processes])
+        queue.sync {}
+        childSeconds = 100
+        _ = sampler.snapshot(now: Date(timeIntervalSince1970: 1_003), demand: [.processes])
+        queue.sync {}
+        let rows = sampler.snapshot(now: Date(timeIntervalSince1970: 1_004)).processes
+
+        XCTAssertEqual(rows.count, 1, "both swift-package processes share a row")
+        XCTAssertEqual(rows.first?.cpuPercent ?? 0, 400, accuracy: 0.01)
+    }
+
     func testProcessRowsUseScriptNamesFoldersAndHistory() {
         let queue = DispatchQueue(label: "TaskbarStatsSamplerTests.processDetails")
         var psOutput = """
