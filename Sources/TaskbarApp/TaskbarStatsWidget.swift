@@ -61,6 +61,7 @@ struct StatsLocalProcessList {
 struct StatsProcessUsage: Equatable {
     var footprintBytes: Double
     var childCPUSeconds: Double
+    var startTime: Double? = nil
 }
 
 /// CPU seconds each live process used during the window, including children that started
@@ -124,7 +125,8 @@ func statsProcessCPUWindow(
 
     // Anything that left since the last sample. What we counted for it (its own time and
     // the children it had reaped) shows up again in an ancestor's child time when it's reaped.
-    for (pid, reading) in previous where currentByPID[pid] == nil {
+    // A pid that's now a different process (reused between samples) counts as gone too.
+    for (pid, reading) in previous where currentByPID[pid].map({ !statsIsSameProcess(reading, $0) }) ?? true {
         let counted = reading.cpuSeconds + (reading.childCPUSeconds ?? 0)
         guard counted > 0 else { continue }
         vanished[pid] = StatsVanishedProcess(reading: reading, ancestor: reading.parentPID, credit: counted, since: now)
@@ -133,15 +135,17 @@ func statsProcessCPUWindow(
     // When a whole chain exits together (bash → swift test → xctest), every link's time
     // rolls up into the nearest ancestor that's still alive, so that's where credit goes,
     // including credit an exiting process was still holding for its own children.
+    // The walk starts from the real parent each time, so when a parent that was missing for
+    // a sample comes back, the credit for its children comes back to it from its ancestor.
     let pending = vanished
     for (pid, entry) in pending {
-        var ancestor = entry.ancestor
+        var ancestor = entry.reading.parentPID
         var hops = 0
         while currentByPID[ancestor] == nil, hops < 64 {
             if let parent = previous[ancestor] {
                 ancestor = parent.parentPID
-            } else if let parent = pending[ancestor], parent.ancestor != ancestor {
-                ancestor = parent.ancestor
+            } else if let parent = pending[ancestor] {
+                ancestor = parent.reading.parentPID
             } else {
                 break
             }
@@ -162,7 +166,9 @@ func statsProcessCPUWindow(
         let start = before[reading.pid]
         let own = reading.cpuSeconds - (start?.cpuSeconds ?? 0)
         var children = 0.0
-        if let childCPU = reading.childCPUSeconds {
+        // A `ps` reading has no child time, so after one we can't tell what's new until the
+        // next native sample. A process that's new this window counts all of it.
+        if let childCPU = reading.childCPUSeconds, start == nil || start?.childCPUSeconds != nil {
             var grown = max(0, childCPU - (start?.childCPUSeconds ?? 0))
             // Oldest first, each one only as far as the growth goes.
             for entry in (creditByAncestor[reading.pid] ?? []).sorted(by: { ($0.since, $0.reading.pid) < ($1.since, $1.reading.pid) }) {
@@ -720,7 +726,8 @@ func readStatsProcessUsage(pid: Int) -> StatsProcessUsage? {
     guard result == 0 else { return nil }
     return StatsProcessUsage(
         footprintBytes: Double(info.ri_phys_footprint),
-        childCPUSeconds: statsMachTicksToSeconds(info.ri_child_user_time + info.ri_child_system_time)
+        childCPUSeconds: statsMachTicksToSeconds(info.ri_child_user_time + info.ri_child_system_time),
+        startTime: Double(info.ri_proc_start_abstime)
     )
 }
 
@@ -1329,6 +1336,7 @@ final class TaskbarStatsSampler {
                         usage[reading.pid] = processUsage
                         var reading = reading
                         reading.childCPUSeconds = processUsage.childCPUSeconds
+                        reading.startTime = processUsage.startTime
                         return reading
                     }
             }

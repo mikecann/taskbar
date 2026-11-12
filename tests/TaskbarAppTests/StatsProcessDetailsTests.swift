@@ -198,6 +198,43 @@ final class StatsProcessDetailsTests: XCTestCase {
         XCTAssertTrue(w34.vanished.isEmpty)
     }
 
+    func testWindowCPUGivesCreditBackToAParentThatComesBack() {
+        // G → P → C. C vanishes unreaped; P is unreadable for a sample (its credit moves up
+        // to G); then P is back, having reaped C. The credit has to follow P again.
+        let s1 = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 1), Self.reading(72, parent: 71, cpu: 30)]
+        let s2 = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 1)]
+        let s3 = [Self.reading(70, cpu: 1)]
+        let s4 = [Self.reading(70, cpu: 1), Self.reading(71, parent: 70, cpu: 1, children: 30.5)]
+
+        let w12 = statsProcessCPUWindow(current: s2, previous: Self.byPID(s1), vanished: [:], now: Self.t0)
+        let w23 = statsProcessCPUWindow(current: s3, previous: Self.byPID(s2), vanished: w12.vanished, now: Self.t0 + 1)
+        let w34 = statsProcessCPUWindow(current: s4, previous: Self.byPID(s3), vanished: w23.vanished, now: Self.t0 + 2)
+
+        XCTAssertEqual(w34.windows[71]?.fromChildren ?? -1, 0.5, accuracy: 0.0001)
+        XCTAssertTrue(w34.vanished.isEmpty, "nothing left on G to hide its real child time")
+    }
+
+    func testWindowCPUCountsAChildWhosePIDWasReusedAsGone() {
+        // P reaps C, and a new process gets C's pid, all between two samples.
+        let s1 = [Self.reading(70, cpu: 1, started: 1), Self.reading(71, parent: 70, cpu: 30, started: 2)]
+        let s2 = [Self.reading(70, cpu: 1, children: 30.5, started: 1), Self.reading(71, parent: 70, cpu: 0.1, started: 3)]
+
+        let window = statsProcessCPUWindow(current: s2, previous: Self.byPID(s1), vanished: [:], now: Self.t0)
+
+        XCTAssertEqual(window.windows[70]?.fromChildren ?? -1, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(window.windows[71]?.total ?? -1, 0.1, accuracy: 0.0001)
+    }
+
+    func testWindowCPUDoesNotReplayChildTimeAfterAReadingWithoutIt() {
+        // One sample came from `ps`, which can't see child time; the next is native again.
+        let s1 = [Self.reading(70, cpu: 1, children: nil)]
+        let s2 = [Self.reading(70, cpu: 1.2, children: 100)]
+
+        let window = statsProcessCPUWindow(current: s2, previous: Self.byPID(s1), vanished: [:], now: Self.t0)
+
+        XCTAssertEqual(window.windows[70]?.total ?? -1, 0.2, accuracy: 0.0001)
+    }
+
     func testWindowCPUExpiresEachVanishedChildOnItsOwnClock() {
         let parent = Self.reading(70, cpu: 1)
         let carried: [Int: StatsVanishedProcess] = [
