@@ -789,7 +789,8 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         queue.sync {}
         XCTAssertTrue(sampler.snapshot(now: Date(timeIntervalSince1970: 1_001)).processes.isEmpty)
 
-        // Three seconds on four cores is 12 core-seconds of capacity.
+        // Three seconds of wall time. Like Activity Monitor, 100% is one full core, so a
+        // process can go past 100% on a machine with more than one.
         psOutput = """
         10 1 0:16.00 100 /usr/bin/swift-frontend
         11 1 0:02.00 100 /usr/bin/swift-frontend
@@ -803,17 +804,17 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         let snapshot = sampler.snapshot(now: Date(timeIntervalSince1970: 1_004))
 
         let byName = Dictionary(uniqueKeysWithValues: snapshot.processes.map { ($0.name, $0) })
-        XCTAssertEqual(byName["swift-frontend"]?.cpuPercent ?? 0, 7.0 / 12 * 100, accuracy: 0.01)
+        XCTAssertEqual(byName["swift-frontend"]?.cpuPercent ?? 0, 7.0 / 3 * 100, accuracy: 0.01)
         XCTAssertEqual(byName["swift-frontend"]?.count, 2)
         XCTAssertEqual(byName["swift-frontend"]?.pid, 10)
         XCTAssertEqual(byName["swift-frontend"]?.memoryBytes, 200 * 1024)
-        XCTAssertEqual(byName["Foo"]?.cpuPercent ?? 0, 0.3 / 12 * 100, accuracy: 0.01)
+        XCTAssertEqual(byName["Foo"]?.cpuPercent ?? 0, 0.3 / 3 * 100, accuracy: 0.01)
         XCTAssertEqual(byName["Foo"]?.appPath, "/Applications/Foo.app")
         // A process that started inside the window counts all of its CPU time.
-        XCTAssertEqual(byName["git"]?.cpuPercent ?? 0, 1.5 / 12 * 100, accuracy: 0.01)
-        // The machine was 80% busy; whatever live processes don't explain is the kernel
-        // plus processes that exited during the window.
-        XCTAssertEqual(snapshot.unattributedProcessCPUPercent, 80 - 8.8 / 12 * 100, accuracy: 0.01)
+        XCTAssertEqual(byName["git"]?.cpuPercent ?? 0, 1.5 / 3 * 100, accuracy: 0.01)
+        // The machine was 80% busy, which is 3.2 of its 4 cores; whatever live processes
+        // don't explain is the kernel plus processes that exited during the window.
+        XCTAssertEqual(snapshot.unattributedProcessCPUPercent, 320 - 8.8 / 3 * 100, accuracy: 0.01)
     }
 
     func testProcessRowsUseScriptNamesFoldersAndHistory() {
@@ -1067,6 +1068,9 @@ final class TaskbarStatsSamplerTests: XCTestCase {
         XCTAssertEqual(formattedStatsSharePercent(5.24), "5.2%")
         XCTAssertEqual(formattedStatsSharePercent(0.04), "0%")
         XCTAssertEqual(formattedStatsSharePercent(11.6), "12%")
+        // Per-core shares go past 100% when a process keeps several cores busy.
+        XCTAssertEqual(formattedStatsSharePercent(233.4), "233%")
+        XCTAssertEqual(formattedStatsSharePercent(-3), "0%")
     }
 
     func testUniquePositiveProcessLookupIgnoresInvalidAndDuplicatePIDs() {

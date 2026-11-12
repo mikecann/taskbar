@@ -1265,7 +1265,10 @@ final class TaskbarStatsSampler {
                 processes = Self.groupedProcesses(
                     readings: readings,
                     previous: baseline.readings,
-                    capacitySeconds: elapsed * Double(self.processorCount),
+                    // Like Activity Monitor and top, 100% is one full core, so the list lines
+                    // up with the per-core bars. A share of the whole machine made a pegged
+                    // core read as 5.5% on an 18-core Mac.
+                    capacitySeconds: elapsed,
                     footprint: { usage[$0]?.footprintBytes },
                     details: self.cachedProcessDetails(
                         for: readings.map { ($0.pid, $0.executablePath) },
@@ -1275,7 +1278,8 @@ final class TaskbarStatsSampler {
                 )
                 processes = self.attachingCPUHistory(to: processes)
                 if let ticks, let total = cpuUsage(currentTicks: ticks, previousTicks: baseline.ticks)?.activePercent {
-                    unattributed = max(0, total - processes.reduce(0) { $0 + $1.cpuPercent })
+                    // `total` is a share of the whole machine; turn it into core-percent too.
+                    unattributed = max(0, total * Double(self.processorCount) - processes.reduce(0) { $0 + $1.cpuPercent })
                 }
             }
 
@@ -1341,8 +1345,9 @@ final class TaskbarStatsSampler {
             return StatsProcessEntry(
                 pid: reading.pid,
                 executablePath: reading.executablePath,
-                cpuPercent: clampedPercent(window.total / capacitySeconds * 100),
-                finishedChildCPUPercent: clampedPercent(window.fromChildren / capacitySeconds * 100),
+                // No upper clamp: a process busy on three cores is 300%.
+                cpuPercent: max(0, window.total / capacitySeconds * 100),
+                finishedChildCPUPercent: max(0, window.fromChildren / capacitySeconds * 100),
                 memoryBytes: footprint(reading.pid) ?? reading.memoryBytes
             )
         }
@@ -1587,10 +1592,11 @@ func formattedStatsPercent(_ value: Double) -> String {
     "\(Int(round(clampedPercent(value))))%"
 }
 
-/// Per-process shares of an 18-core machine are often a few percent, so keep a decimal there.
+/// Per-process CPU, where 100% is one full core, so a busy process can pass 100%.
+/// Small values keep a decimal so light background work doesn't all read as 0% or 1%.
 func formattedStatsSharePercent(_ value: Double) -> String {
-    let value = clampedPercent(value)
-    guard value >= 0.05, value < 9.95 else { return formattedStatsPercent(value) }
+    let value = max(0, value)
+    guard value >= 0.05, value < 9.95 else { return "\(Int(round(value)))%" }
     return String(format: "%.1f%%", value)
 }
 
@@ -2165,6 +2171,8 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
     private var lastProcessOrder: [String] = []
     private var processTableRect: NSRect = .zero
     private var processTableItems: [StatsProcessTableItem] = []
+    /// Column titles that explain themselves on hover, like the CPU "Usage" scale.
+    private var processHeaderTips: [(rect: NSRect, text: String)] = []
     private var processRowsByKey: [String: StatsProcessSample] = [:]
     private var expandedSubrows: [StatsProcessSubrow] = []
     private var processTrackingArea: NSTrackingArea?
@@ -2234,6 +2242,9 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
     }
 
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        if let tip = processHeaderTips.first(where: { $0.rect.contains(point) }) {
+            return tip.text
+        }
         guard let item = processTableItem(at: point) else { return "" }
         switch item {
         case let .group(key, _):
@@ -2374,7 +2385,8 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
                 value: { $0.cpuPercent },
                 // Live time per folder; finished subprocesses get their own line below.
                 memberValue: { $0.cpuPercent - $0.finishedChildCPUPercent },
-                format: formattedStatsSharePercent
+                format: formattedStatsSharePercent,
+                tip: "100% is one full core, like Activity Monitor. This Mac has \(ProcessInfo.processInfo.activeProcessorCount) cores, so a busy app can show more than 100%."
             )],
             showsHistory: true,
             y: 618,
@@ -2527,7 +2539,8 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
 
     private func topCPUProcesses(_ snapshot: StatsSnapshot) -> [StatsProcessSample] {
         var rows = snapshot.processes
-        if !rows.isEmpty, snapshot.unattributedProcessCPUPercent >= 0.5 {
+        // 5% of one core, about the same bar as 0.5% of the whole machine used to be.
+        if !rows.isEmpty, snapshot.unattributedProcessCPUPercent >= 5 {
             rows.append(StatsProcessSample(
                 pid: 0,
                 name: "Kernel and exited",
@@ -2901,8 +2914,12 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
         let value: (StatsProcessSample) -> Double = { row in columns.reduce(0) { $0 + $1.value(row) } }
 
         drawStatsText("Process", in: NSRect(x: 60, y: y, width: 160, height: 18), size: 12, weight: .semibold, color: dim)
+        processHeaderTips = []
         for (column, rect) in zip(columns, columnRects) {
             let header = NSRect(x: rect.minX, y: y, width: rect.width, height: 18)
+            if let tip = column.tip {
+                processHeaderTips.append((header, tip))
+            }
             if let color = column.color {
                 // Same colour key as the Download and Upload figures at the top.
                 color.withAlphaComponent(0.9).setFill()
@@ -2976,6 +2993,9 @@ private final class StatsPopoverView: NSView, NSViewToolTipOwner {
             removeAllToolTips()
             for item in items {
                 addToolTip(item.rect, owner: self, userData: nil)
+            }
+            for (rect, _) in processHeaderTips {
+                addToolTip(rect, owner: self, userData: nil)
             }
         }
 
@@ -3416,4 +3436,6 @@ struct StatsTableColumn {
     var value: (StatsProcessSample) -> Double
     var memberValue: (StatsProcessMember) -> Double
     var format: (Double) -> String
+    /// Shown when hovering the column title.
+    var tip: String? = nil
 }
