@@ -48,18 +48,17 @@ func batteryEnergyUsers(
         groups[key] = group
     }
 
-    return groups.values
-        .map {
-            BatteryEnergyUser(
-                name: $0.name,
-                impact: ($0.impact * 10).rounded() / 10,
-                appPath: $0.path,
-                processCount: $0.count
-            )
-        }
-        .sorted { $0.impact == $1.impact ? $0.name < $1.name : $0.impact > $1.impact }
-        .prefix(limit)
-        .map { $0 }
+    // Split up, with types spelled out: as one chain, CI's compiler gave up
+    // type-checking it (red from 12 to 20 Nov 2026).
+    let users: [BatteryEnergyUser] = groups.values.map { group in
+        let impact: Double = (group.impact * 10).rounded() / 10
+        return BatteryEnergyUser(name: group.name, impact: impact, appPath: group.path, processCount: group.count)
+    }
+    let sorted = users.sorted { (left: BatteryEnergyUser, right: BatteryEnergyUser) -> Bool in
+        if left.impact == right.impact { return left.name < right.name }
+        return left.impact > right.impact
+    }
+    return Array(sorted.prefix(limit))
 }
 
 func batteryOutermostAppBundle(_ path: String) -> String? {
