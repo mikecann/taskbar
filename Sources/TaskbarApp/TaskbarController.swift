@@ -558,9 +558,11 @@ final class TaskbarController: NSObject {
             guard let pid = item.pid else { return }
             // Shown at once as a muted speaker; the button goes once the sound stops.
             audioPauseRequestedAt[pid] = ProcessInfo.processInfo.systemUptime
-            pauseAgentBrowserMedia(pid: pid) { [weak self] reached in
-                log("agent browser pause reached \(reached) pages and frames")
-                if reached == 0 { self?.audioPauseRequestedAt[pid] = nil }
+            pauseAgentBrowserMedia(pid: pid) { [weak self] result in
+                log("agent browser pause reached \(result.reached) pages and frames, stopped \(result.paused)")
+                // Nothing stopped means the sound carries on: show it again
+                // and let the next click try.
+                if result.paused == 0 { self?.audioPauseRequestedAt[pid] = nil }
                 self?.scheduleRefreshSoon(after: 0)
             }
             refresh()
@@ -630,10 +632,12 @@ final class TaskbarController: NSObject {
         menuScreenContext = screenID
 
         let menu = NSMenu(title: item.owner)
-        let pinTitle = item.isPinned ? "Unpin \(item.owner)" : "Pin \(item.owner)"
-        let pinItem = NSMenuItem(title: pinTitle, action: #selector(togglePinnedMenuItem), keyEquivalent: "")
-        pinItem.target = self
-        menu.addItem(pinItem)
+        if taskbarItemCanBePinned(item) {
+            let pinTitle = item.isPinned ? "Unpin \(item.owner)" : "Pin \(item.owner)"
+            let pinItem = NSMenuItem(title: pinTitle, action: #selector(togglePinnedMenuItem), keyEquivalent: "")
+            pinItem.target = self
+            menu.addItem(pinItem)
+        }
 
         if item.pid != nil {
             let forceQuitItem = NSMenuItem(title: "Force Quit \(item.owner)", action: #selector(forceQuitMenuItem), keyEquivalent: "")

@@ -96,4 +96,48 @@ final class TaskbarAudioTests: XCTestCase {
             "ws://127.0.0.1:9339/devtools/page/B"
         ])
     }
+
+    // Review, 20 Nov 2026: dragging a file over the button paused the agent's
+    // tabs, and Pin saved a launcher for plain Helium.
+    func testAgentBrowserButtonTakesNoDragHoverAndCantBePinned() throws {
+        let agent = TaskbarRunningApp(name: "Helium", pid: 50, bundleID: "net.imput.helium", appPath: "/Applications/Helium.app")
+        let item = try XCTUnwrap(taskbarAgentAudioItems([agent], pausePending: []).first)
+        XCTAssertFalse(taskbarItemOpensOnDragHover(item))
+        XCTAssertFalse(taskbarItemCanBePinned(item))
+        let slackItem = try XCTUnwrap(buildTaskbarItems(windows: [], frontmostPID: nil, runningApps: [slack]).first)
+        XCTAssertTrue(taskbarItemCanBePinned(slackItem))
+    }
+
+    func testAWideBadgeShrinksToADotRatherThanCoverTheSpeaker() throws {
+        let iconRect = NSRect(x: 10, y: 4, width: 24, height: 24)
+        let speaker = try XCTUnwrap(taskbarAudioMarkerRect(in: iconRect))
+
+        let wide = try XCTUnwrap(taskbarBadgeLayout("120", in: iconRect, clearOf: speaker.maxX))
+        XCTAssertEqual(wide.text, "")
+        XCTAssertFalse(wide.rect.intersects(speaker))
+
+        let narrow = try XCTUnwrap(taskbarBadgeLayout("3", in: iconRect, clearOf: speaker.maxX))
+        XCTAssertEqual(narrow.text, "3")
+        XCTAssertFalse(narrow.rect.intersects(speaker))
+
+        // With no sound playing the count shows in full.
+        XCTAssertEqual(taskbarBadgeLayout("120", in: iconRect)?.text, "99+")
+    }
+
+    func testOnlyCleanDevToolsRepliesCountAsDone() {
+        XCTAssertNotNil(devToolsResult(["id": 1, "result": ["result": ["type": "number", "value": 2]]]))
+        XCTAssertNil(devToolsResult(["id": 1, "error": ["code": -32000, "message": "Cannot find context with specified id"]]))
+        XCTAssertNil(devToolsResult(["id": 1, "result": ["result": ["type": "object"], "exceptionDetails": ["text": "Uncaught"]]]))
+        XCTAssertNil(devToolsResult(["id": 1]))
+    }
+
+    func testSilencesEveryPageWorldButSkipsExtensionWorlds() {
+        let events: [[String: Any]] = [
+            ["method": "Runtime.executionContextCreated", "params": ["context": ["id": 1, "auxData": ["isDefault": true, "frameId": "top"]]]],
+            ["method": "Runtime.executionContextCreated", "params": ["context": ["id": 2, "auxData": ["isDefault": true, "frameId": "child"]]]],
+            ["method": "Runtime.executionContextCreated", "params": ["context": ["id": 3, "auxData": ["isDefault": false, "type": "isolated"]]]],
+            ["method": "Runtime.consoleAPICalled", "params": [:]]
+        ]
+        XCTAssertEqual(devToolsPageContextIDs(events), [1, 2])
+    }
 }

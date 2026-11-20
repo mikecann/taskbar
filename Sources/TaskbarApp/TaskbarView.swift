@@ -373,7 +373,8 @@ final class TaskbarView: NSView {
             )
         }
 
-        drawTaskbarBadge(item.badgeLabel, in: iconRect)
+        let speaker = item.isPlayingAudio ? taskbarAudioMarkerRect(in: iconRect) : nil
+        drawTaskbarBadge(item.badgeLabel, in: iconRect, clearOf: speaker?.maxX)
         drawTaskbarAudioMarker(for: item, in: iconRect)
         drawTaskbarProfileBadge(item.profileBadge, in: iconRect)
         if taskbarItemShowsPinMarker(item) {
@@ -582,7 +583,11 @@ struct TaskbarDragHover {
 /// A click on the frontmost tile minimizes it, which is the opposite of what
 /// you want while carrying something to drop into it, so that one is skipped.
 func taskbarItemOpensOnDragHover(_ item: TaskbarItem) -> Bool {
-    taskbarItemClickAction(for: item) != .minimize
+    switch taskbarItemClickAction(for: item) {
+    case .restore, .activate, .launch: return true
+    // The agent browser's button pauses its sound; a drag shouldn't.
+    case .minimize, .pauseAgentAudio, .ignore: return false
+    }
 }
 
 /// The bar only watches drags, so it registers for every common kind of

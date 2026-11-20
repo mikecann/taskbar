@@ -206,6 +206,12 @@ func drawTaskbarText(
     (value as NSString).draw(in: rect, withAttributes: attributes)
 }
 
+/// The agent browser's button stands for BrowserBear's session, not the app:
+/// pinning it would save a launcher for plain Helium or Chrome.
+func taskbarItemCanBePinned(_ item: TaskbarItem) -> Bool {
+    !item.isAgentBrowser
+}
+
 func taskbarItemShowsPinMarker(_ item: TaskbarItem) -> Bool {
     item.isPinned
 }

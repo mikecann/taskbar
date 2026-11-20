@@ -114,15 +114,30 @@ func collectDockBadges() -> [String: String] {
     return result
 }
 
-func drawTaskbarBadge(_ label: String?, in iconRect: NSRect) {
-    guard let text = taskbarBadgeText(label), iconRect.width >= 12 else { return }
+/// Where the Dock badge goes and what it says. `clearOf` is the right edge of
+/// the speaker when one shows: a count too wide for the room left becomes a
+/// dot rather than cover it.
+func taskbarBadgeLayout(_ label: String?, in iconRect: NSRect, clearOf leftEdge: CGFloat? = nil) -> (rect: NSRect, text: String)? {
+    guard var text = taskbarBadgeText(label), iconRect.width >= 12 else { return nil }
+    let font = NSFont.systemFont(ofSize: 8, weight: .bold)
+    func width(_ text: String) -> CGFloat {
+        if text.isEmpty { return 7 }
+        let textWidth = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        return min(iconRect.width, max(12, textWidth + 5))
+    }
+    let room = iconRect.maxX - max(iconRect.minX, leftEdge ?? iconRect.minX)
+    if !text.isEmpty, width(text) > room { text = "" }
+    let height: CGFloat = text.isEmpty ? 7 : 12
+    let badgeWidth = width(text)
+    return (NSRect(x: iconRect.maxX - badgeWidth, y: iconRect.maxY - height, width: badgeWidth, height: height), text)
+}
+
+func drawTaskbarBadge(_ label: String?, in iconRect: NSRect, clearOf leftEdge: CGFloat? = nil) {
+    guard let (rect, text) = taskbarBadgeLayout(label, in: iconRect, clearOf: leftEdge) else { return }
     let font = NSFont.systemFont(ofSize: 8, weight: .bold)
     let textSize = (text as NSString).size(withAttributes: [.font: font])
-    let height: CGFloat = text.isEmpty ? 7 : 12
-    let width = text.isEmpty ? height : min(iconRect.width, max(height, ceil(textSize.width) + 5))
-    let rect = NSRect(x: iconRect.maxX - width, y: iconRect.maxY - height, width: width, height: height)
     NSColor.systemRed.setFill()
-    NSBezierPath(roundedRect: rect, xRadius: height / 2, yRadius: height / 2).fill()
+    NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
     if !text.isEmpty {
         (text as NSString).draw(at: NSPoint(x: rect.midX - textSize.width / 2, y: rect.midY - textSize.height / 2),
                                withAttributes: [.font: font, .foregroundColor: NSColor.white])
