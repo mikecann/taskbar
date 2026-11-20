@@ -75,6 +75,12 @@ Clicking the already selected window keeps it active. Right-click an app to pin
 it, and right-click the bar to open settings for that monitor. Enable Start at
 login in settings if you want it to launch automatically.
 
+An app that's playing sound gets a small blue speaker on its icon, so you can
+find a video left playing somewhere (macOS 14 or later, no permission needed).
+If it's BrowserBear's agent browser, which normally stays off the bar, it gets
+an "Agent browser" button while it plays. Click that to pause its videos and
+audio.
+
 The bar hides for foreground fullscreen apps and can auto-hide. The settings
 also let you keep normal windows above it, adjust button widths and spacing,
 and choose widgets for each monitor.

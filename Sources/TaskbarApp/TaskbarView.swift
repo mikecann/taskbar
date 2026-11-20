@@ -374,6 +374,7 @@ final class TaskbarView: NSView {
         }
 
         drawTaskbarBadge(item.badgeLabel, in: iconRect)
+        drawTaskbarAudioMarker(for: item, in: iconRect)
         drawTaskbarProfileBadge(item.profileBadge, in: iconRect)
         if taskbarItemShowsPinMarker(item) {
             drawTaskbarPinMarker(in: iconRect)

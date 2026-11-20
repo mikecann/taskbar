@@ -269,6 +269,8 @@ final class TaskbarController: NSObject {
     private var pendingRefreshWorkItem: DispatchWorkItem?
     private var isWaitingForInitialWindowProviderWarmup = false
     private var pendingFrontmostWindowExpectation: FrontmostWindowExpectation?
+    /// When the agent browser's pause was clicked, by its pid (TaskbarAudio.swift).
+    private var audioPauseRequestedAt: [pid_t: TimeInterval] = [:]
     private var settingsChangeObservation: TaskbarSettingsChangeObservation?
     private var screenParametersObservation: NSObjectProtocol?
     private var settingsWindowController: TaskbarSettingsWindow?
@@ -356,6 +358,7 @@ final class TaskbarController: NSObject {
     private func finishStarting() {
         focusMonitor.start()
         TaskbarBadgeSampler.shared.onChange = { [weak self] in self?.scheduleRefreshSoon(after: 0) }
+        TaskbarAudioSampler.shared.onChange = { [weak self] in self?.scheduleRefreshSoon(after: 0) }
         ChromeProfileStore.shared.onChange = { [weak self] in self?.scheduleRefreshSoon(after: 0) }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -377,6 +380,7 @@ final class TaskbarController: NSObject {
         closeStudioControls()
         focusMonitor.stop()
         TaskbarBadgeSampler.shared.onChange = nil
+        TaskbarAudioSampler.shared.onChange = nil
         ChromeProfileStore.shared.onChange = nil
         ControlCenterLightsController.shared.stop()
         BatteryHistoryRecorder.shared.stop()
@@ -478,6 +482,18 @@ final class TaskbarController: NSObject {
                                      pid: app.processIdentifier, bundleID: app.bundleIdentifier ?? "", appPath: url.path)
         }
         let windowlessApps = taskbarWindowlessApps(runningApps, representedPIDs: representedPIDs)
+        let audioPIDs = TaskbarAudioSampler.shared.snapshot()
+        audioPauseRequestedAt = audioPauseRequestedAt.filter { audioPIDs.contains($0.key) }
+        let agentAudioItems = taskbarAgentAudioItems(
+            NSWorkspace.shared.runningApplications.compactMap { app -> TaskbarRunningApp? in
+                guard audioPIDs.contains(app.processIdentifier),
+                      AgentChromeProcesses.shared.contains(app.processIdentifier),
+                      let url = app.bundleURL else { return nil }
+                return TaskbarRunningApp(name: app.localizedName ?? "", pid: app.processIdentifier,
+                                         bundleID: app.bundleIdentifier ?? "", appPath: url.path)
+            },
+            pausePending: taskbarPendingAudioPauses(audioPauseRequestedAt, now: ProcessInfo.processInfo.systemUptime)
+        )
         for screen in screens {
             let values = valuesByScreen[screen.id] ?? settings.values(for: screen.persistentID)
             let taskbarWindows = visibleWindows(
@@ -495,7 +511,8 @@ final class TaskbarController: NSObject {
             )
             panels[screen.id]?.update(
                 screen: screen,
-                items: applyingChromeProfiles(to: applyingTaskbarBadges(badges, to: items)),
+                items: applyingAudioPlaying(audioPIDs, to: applyingChromeProfiles(to: applyingTaskbarBadges(badges, to: items)))
+                    + agentAudioItems,
                 values: values,
                 isObscuredByFullscreenWindow: fullscreenScreenIDs.contains(screen.id)
             )
@@ -537,6 +554,19 @@ final class TaskbarController: NSObject {
         case .launch:
             pendingFrontmostWindowExpectation = nil
             _ = launchApplication(appPath: item.appPath, bundleID: item.bundleID)
+        case .pauseAgentAudio:
+            guard let pid = item.pid else { return }
+            // Shown at once as a muted speaker; the button goes once the sound stops.
+            audioPauseRequestedAt[pid] = ProcessInfo.processInfo.systemUptime
+            pauseAgentBrowserMedia(pid: pid) { [weak self] reached in
+                log("agent browser pause reached \(reached) pages and frames")
+                if reached == 0 { self?.audioPauseRequestedAt[pid] = nil }
+                self?.scheduleRefreshSoon(after: 0)
+            }
+            refresh()
+            return
+        case .ignore:
+            return
         }
         scheduleRefreshSoon()
     }

@@ -24,7 +24,7 @@ func taskbarItemLabel(_ item: TaskbarItem) -> String {
 
 func taskbarItemShowsLabel(_ item: TaskbarItem) -> Bool {
     // Apps without windows are compact launchers, whether running or pinned.
-    item.windowCount > 0 && !(item.isPinned && item.pid == nil)
+    item.isAgentBrowser || item.windowCount > 0 && !(item.isPinned && item.pid == nil)
 }
 
 func preferredTaskbarItemWidth(

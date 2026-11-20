@@ -18,44 +18,49 @@ func applyingTaskbarBadges(_ badges: [String: String], to items: [TaskbarItem]) 
     }
 }
 
-final class TaskbarBadgeSampler {
-    static let shared = TaskbarBadgeSampler()
+/// Collects a value on a background queue at most every `interval` seconds and
+/// hands back the last one at once, so slow system calls never block drawing or
+/// the taskbar's main event loop. `onChange` runs on the main queue.
+class TaskbarBackgroundSampler<Value: Equatable> {
     private let lock = NSLock()
-    private let collect: () -> [String: String]
+    private let interval: TimeInterval
+    private let collect: () -> Value
     private let schedule: (@escaping () -> Void) -> Void
-    private var cached: [String: String] = [:]
+    private var cached: Value
     private var lastRefresh = Date.distantPast
     private var refreshing = false
     var onChange: (() -> Void)?
 
     init(
-        collect: @escaping () -> [String: String] = collectDockBadges,
+        initial: Value,
+        interval: TimeInterval,
+        collect: @escaping () -> Value,
         schedule: @escaping (@escaping () -> Void) -> Void = { work in
             DispatchQueue.global(qos: .utility).async(execute: work)
         }
     ) {
+        self.cached = initial
+        self.interval = interval
         self.collect = collect
         self.schedule = schedule
     }
 
-    func snapshot(now: Date = Date()) -> [String: String] {
+    func snapshot(now: Date = Date()) -> Value {
         lock.lock()
         let result = cached
-        let shouldRefresh = !refreshing && now.timeIntervalSince(lastRefresh) >= 2
+        let shouldRefresh = !refreshing && now.timeIntervalSince(lastRefresh) >= interval
         if shouldRefresh {
             refreshing = true
             lastRefresh = now
         }
         lock.unlock()
         if shouldRefresh {
-            // Accessibility calls can block when the Dock is busy. Never do
-            // them in drawing or on the taskbar's main event loop.
             schedule { [weak self] in
                 guard let self else { return }
-                let badges = self.collect()
+                let value = self.collect()
                 self.lock.lock()
-                let changed = self.cached != badges
-                self.cached = badges
+                let changed = self.cached != value
+                self.cached = value
                 self.refreshing = false
                 self.lock.unlock()
                 if changed {
@@ -64,6 +69,21 @@ final class TaskbarBadgeSampler {
             }
         }
         return result
+    }
+}
+
+/// Accessibility calls can block when the Dock is busy, so badges are read in
+/// the background.
+final class TaskbarBadgeSampler: TaskbarBackgroundSampler<[String: String]> {
+    static let shared = TaskbarBadgeSampler()
+
+    init(
+        collect: @escaping () -> [String: String] = collectDockBadges,
+        schedule: @escaping (@escaping () -> Void) -> Void = { work in
+            DispatchQueue.global(qos: .utility).async(execute: work)
+        }
+    ) {
+        super.init(initial: [:], interval: 2, collect: collect, schedule: schedule)
     }
 }
 

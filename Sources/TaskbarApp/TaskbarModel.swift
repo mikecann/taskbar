@@ -102,6 +102,12 @@ struct TaskbarItem: Equatable {
     /// The Chrome profile a browser window belongs to, from its title.
     var browserProfileName: String? = nil
     var profileBadge: TaskbarProfileBadge? = nil
+    /// The app is sending sound to a speaker or headphones (TaskbarAudio.swift).
+    var isPlayingAudio = false
+    /// BrowserBear's agent browser, shown only while it plays sound.
+    var isAgentBrowser = false
+    /// Its pause was clicked and the sound hasn't stopped yet.
+    var isAudioPausePending = false
 
     var identity: String {
         identityForTaskbar(bundleID: bundleID, appPath: appPath)
@@ -124,9 +130,12 @@ enum TaskbarItemClickAction: Equatable {
     case restore
     case activate
     case launch
+    case pauseAgentAudio
+    case ignore
 }
 
 func taskbarItemClickAction(for item: TaskbarItem) -> TaskbarItemClickAction {
+    if item.isAgentBrowser { return item.isAudioPausePending ? .ignore : .pauseAgentAudio }
     guard item.pid != nil, item.windowCount > 0 else { return .launch }
     if item.isMinimized { return .restore }
     if item.isFrontmost { return .minimize }
